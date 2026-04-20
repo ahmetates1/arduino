@@ -11,7 +11,10 @@ const int MID_PIN  = 7;
 const int HIGH_PIN = 8;
 
 const int NETWORK_ID = 77;
-const int TANK_ID = 5;
+const int TANK_ID = 4;
+
+const long BASE_DELAY_MS = 15000;
+const long JITTER_MAX_MS = 5000;
 
 void setup() {
 
@@ -22,7 +25,9 @@ void setup() {
   pinMode(MID_PIN, INPUT_PULLUP);
   pinMode(HIGH_PIN, INPUT_PULLUP);
 
-  Serial.println("Depo 1 node basladi");
+  randomSeed(analogRead(A0));
+
+  Serial.println("Depo 4 node basladi");
 }
 
 void loop() {
@@ -47,5 +52,12 @@ void loop() {
   Serial.print("Gonderildi -> ");
   Serial.println(packet);
 
-  delay(15000);  
+  long jitter = random(0, JITTER_MAX_MS);
+  long totalDelay = BASE_DELAY_MS + jitter;
+
+  Serial.print("Sonraki gonderim: ");
+  Serial.print(totalDelay / 1000);
+  Serial.println(" sn");
+
+  delay(totalDelay);
 }
