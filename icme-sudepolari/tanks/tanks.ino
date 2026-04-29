@@ -11,7 +11,7 @@ const int MID_PIN  = 7;
 const int HIGH_PIN = 8;
 
 const int NETWORK_ID = 77;
-const int TANK_ID = 4;
+const int TANK_ID = 5;
 
 const long BASE_DELAY_MS = 15000;
 const long JITTER_MAX_MS = 5000;
