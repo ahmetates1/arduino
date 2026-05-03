@@ -43,6 +43,8 @@ TankAggState tankAgg[TANK_COUNT];
 unsigned long lastLoraPacketMs[TANK_COUNT];
 bool everReceivedLoRa[TANK_COUNT];
 bool staleNullSent[TANK_COUNT];
+// NULL POST basarisizsa loop spamini onlemek icin (ms)
+unsigned long lastStaleNullFailMs[TANK_COUNT];
 
 bool parseLoRaPacket(const String& data, int& id, int& low, int& mid, int& high) {
   // Beklenen format: 77|id|low|mid|high
@@ -106,6 +108,7 @@ void setup() {
     lastLoraPacketMs[i] = 0;
     everReceivedLoRa[i] = false;
     staleNullSent[i] = false;
+    lastStaleNullFailMs[i] = 0;
   }
   
   Serial.println("Sistem Hazir. Veri bekleniyor...\n");
@@ -136,10 +139,13 @@ void loop() {
 void processAndSendData(int id, int low, int mid, int high) {
   const char* name = tankNames[id - 1];
   int tankIdx = id - 1;
+  // 5dk sessizlikten sonra value=null yazildiysa, ilk geri donus paketini
+  // seviye ayni olsa bile bir kez gonderip dashboard'u "veri yok"tan cikart.
+  const bool recoveringAfterStale = staleNullSent[tankIdx];
   // Her gecerli pakette zaman damgasi (seviye ayni olsa bile) — "veri gelmiyor" icin sessizlik olcumu
   lastLoraPacketMs[tankIdx] = millis();
   everReceivedLoRa[tankIdx] = true;
-  staleNullSent[tankIdx] = false;
+  // staleNullSent sadece Supabase'e basariyla yazildiktan sonra sifirlanir (yoksa "veri yok" takilir)
 
   // Yüzde Hesaplama
   int levelPct = 0;
@@ -161,25 +167,35 @@ void processAndSendData(int id, int low, int mid, int high) {
   } else if (tankAgg[tankIdx].lastSentLevel != levelPct) {
     shouldSend = true;
     Serial.println("[AGG] Seviye degisti, aninda gonderilecek.");
+  } else if (recoveringAfterStale) {
+    shouldSend = true;
+    Serial.println("[AGG] Stale sonrasi ilk paket, seviye ayni olsa da gonderilecek.");
   } else {
     Serial.println("[AGG] Ayni seviye, gonderim yok.");
   }
 
   if (!shouldSend) return;
 
+  bool writeOk = false;
   if (WiFi.status() == WL_CONNECTED) {
-    sendToSupabaseInt(name, levelPct);
+    writeOk = sendToSupabaseInt(name, levelPct);
   } else {
-    queueForSupabaseInt(name, levelPct);
+    writeOk = queueForSupabaseInt(name, levelPct);
   }
 
-  tankAgg[tankIdx].lastSentLevel = levelPct;
-  tankAgg[tankIdx].initialized = true;
+  if (writeOk) {
+    staleNullSent[tankIdx] = false;
+    lastStaleNullFailMs[tankIdx] = 0;
+    tankAgg[tankIdx].lastSentLevel = levelPct;
+    tankAgg[tankIdx].initialized = true;
+  } else {
+    Serial.printf("[AGG] Supabase yazilamadi (%s), agregasyon korunur (tekrar denenecek).\n", name);
+  }
 }
 
 // --- Supabase ve WiFi Fonksiyonları ---
 
-void sendToSupabaseInt(const char* name, int value) {
+bool sendToSupabaseInt(const char* name, int value) {
   HTTPClient http;
   http.begin(supabaseUrl);
   http.addHeader("Content-Type", "application/json");
@@ -189,16 +205,18 @@ void sendToSupabaseInt(const char* name, int value) {
   String body = String("{\"name\":\"") + name + "\",\"value\":" + String(value) + "}";
   int httpCode = http.POST(body);
 
-  if (httpCode > 0) {
+  if (httpCode >= 200 && httpCode < 300) {
     Serial.printf("[HTTP] Basarili, Kod: %d\n", httpCode);
-  } else {
-    Serial.printf("[HTTP] Hata: %s\n", http.errorToString(httpCode).c_str());
+    http.end();
+    return true;
   }
+  Serial.printf("[HTTP] Basarisiz kod=%d err=%s\n", httpCode, http.errorToString(httpCode).c_str());
   http.end();
+  return false;
 }
 
 // Supabase'de "son kayit veri gelmiyor" anlami icin JSON null (kolon nullable olmali)
-void sendToSupabaseNull(const char* name) {
+bool sendToSupabaseNull(const char* name) {
   HTTPClient http;
   http.begin(supabaseUrl);
   http.addHeader("Content-Type", "application/json");
@@ -208,12 +226,15 @@ void sendToSupabaseNull(const char* name) {
   String body = String("{\"name\":\"") + name + "\",\"value\":null}";
   int httpCode = http.POST(body);
 
-  if (httpCode > 0) {
-    Serial.printf("[HTTP] NULL heartbeat %s, Kod: %d\n", name, httpCode);
-  } else {
-    Serial.printf("[HTTP] NULL heartbeat hata: %s\n", http.errorToString(httpCode).c_str());
+  if (httpCode >= 200 && httpCode < 300) {
+    Serial.printf("[HTTP] NULL %s, Kod: %d\n", name, httpCode);
+    http.end();
+    return true;
   }
+  Serial.printf("[HTTP] NULL basarisiz %s kod=%d err=%s\n", name, httpCode,
+                http.errorToString(httpCode).c_str());
   http.end();
+  return false;
 }
 
 void checkStaleSensors() {
@@ -225,15 +246,27 @@ void checkStaleSensors() {
     if (last == 0) continue;
     if ((unsigned long)(now - last) < STALE_SILENCE_MS) continue;
 
+    if (lastStaleNullFailMs[i] != 0 &&
+        (unsigned long)(now - lastStaleNullFailMs[i]) < 60000UL) {
+      continue;
+    }
+
     const char* name = tankNames[i];
     Serial.printf("[STALE] 5dk paket yok: %s -> Supabase value=null\n", name);
 
+    bool nullOk = false;
     if (WiFi.status() == WL_CONNECTED) {
-      sendToSupabaseNull(name);
+      nullOk = sendToSupabaseNull(name);
     } else {
-      queueForSupabaseNull(name);
+      nullOk = queueForSupabaseNull(name);
     }
-    staleNullSent[i] = true;
+    if (nullOk) {
+      staleNullSent[i] = true;
+      lastStaleNullFailMs[i] = 0;
+    } else {
+      lastStaleNullFailMs[i] = now;
+      Serial.printf("[STALE] NULL yazilamadi: %s (stale bayragi set edilmedi, tekrar denenecek)\n", name);
+    }
   }
 }
 
@@ -254,7 +287,7 @@ void checkWiFi() {
   }
 }
 
-void queueForSupabaseInt(const char* name, int value) {
+bool queueForSupabaseInt(const char* name, int value) {
   for (int i = 0; i < QUEUE_SIZE; i++) {
     if (!sendQueue[i].used) {
       strncpy(sendQueue[i].name, name, 11);
@@ -263,12 +296,14 @@ void queueForSupabaseInt(const char* name, int value) {
       sendQueue[i].isNull = false;
       sendQueue[i].used = true;
       Serial.println("[WIFI YOK] Veri kuyruga alindi.");
-      return;
+      return true;
     }
   }
+  Serial.println("[WIFI YOK] Kuyruk dolu, veri atildi.");
+  return false;
 }
 
-void queueForSupabaseNull(const char* name) {
+bool queueForSupabaseNull(const char* name) {
   for (int i = 0; i < QUEUE_SIZE; i++) {
     if (!sendQueue[i].used) {
       strncpy(sendQueue[i].name, name, 11);
@@ -276,21 +311,23 @@ void queueForSupabaseNull(const char* name) {
       sendQueue[i].isNull = true;
       sendQueue[i].used = true;
       Serial.println("[WIFI YOK] NULL heartbeat kuyruga alindi.");
-      return;
+      return true;
     }
   }
+  Serial.println("[WIFI YOK] Kuyruk dolu, NULL atlandi.");
+  return false;
 }
 
 void flushQueue() {
   for (int i = 0; i < QUEUE_SIZE; i++) {
     if (sendQueue[i].used) {
-      if (sendQueue[i].isNull) {
-        sendToSupabaseNull(sendQueue[i].name);
-      } else {
-        sendToSupabaseInt(sendQueue[i].name, sendQueue[i].value);
+      bool ok = sendQueue[i].isNull
+                    ? sendToSupabaseNull(sendQueue[i].name)
+                    : sendToSupabaseInt(sendQueue[i].name, sendQueue[i].value);
+      if (ok) {
+        sendQueue[i].used = false;
+        sendQueue[i].isNull = false;
       }
-      sendQueue[i].used = false;
-      sendQueue[i].isNull = false;
       delay(200); // Sunucuyu yormayalım
     }
   }

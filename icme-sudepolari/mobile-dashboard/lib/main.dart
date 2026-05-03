@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math' as math;
 
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/foundation.dart';
@@ -9,7 +8,59 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:syncfusion_flutter_gauges/gauges.dart';
+
+/// Ham `Exception` / JSON govdesi yerine kullaniciya gosterilecek mesaj.
+String _formatSensorFetchError(Object error) {
+  final String raw = error.toString();
+
+  if (error is TimeoutException ||
+      raw.contains('TimeoutException') ||
+      raw.contains('zaman asim')) {
+    return 'Sunucuya zamaninda ulasilamadi. Baglantiyi kontrol edip tekrar deneyin.';
+  }
+  if (raw.contains('SocketException') ||
+      raw.contains('Failed host lookup') ||
+      raw.contains('Network is unreachable') ||
+      raw.contains('Connection refused')) {
+    return 'Internet baglantisi yok veya sunucuya ulasilamiyor.';
+  }
+  if (raw.contains('HandshakeException') ||
+      raw.contains('CERTIFICATE_VERIFY_FAILED')) {
+    return 'Guvenli baglanti kurulamadi.';
+  }
+  if (raw.contains('ClientException')) {
+    return 'Ag istegi tamamlanamadi. Baglantiyi kontrol edin.';
+  }
+  if (error is FormatException || raw.contains('FormatException')) {
+    return 'Sunucu yaniti beklenen formatta degil.';
+  }
+
+  final RegExp codeRx = RegExp(r'\b(\d{3})\b');
+  final Match? m = codeRx.firstMatch(raw);
+  if (m != null) {
+    final int code = int.parse(m.group(1)!);
+    if (code == 401 || code == 403) {
+      return 'Veritabanina erisim reddedildi (yetki). Yonetici ile iletisime gecin.';
+    }
+    if (code == 404) {
+      return 'Istenen kaynak bulunamadi.';
+    }
+    if (code >= 500 && code < 600) {
+      return 'Sunucu gecici olarak yanit veremiyor. Bir sure sonra yenileyin.';
+    }
+    if (code >= 400 && code < 500) {
+      return 'Istek kabul edilmedi (kod $code).';
+    }
+  }
+
+  return 'Veri alinamadi. Asagi cekerek yenileyin veya baglantinizi kontrol edin.';
+}
+
+void _debugLogFetchFailure(String context, Object error) {
+  if (kDebugMode) {
+    debugPrint('[$context] $error');
+  }
+}
 
 class LowTankNotifier {
   LowTankNotifier._();
@@ -136,6 +187,20 @@ DateTime? _parseCreatedAtUtc(dynamic raw) {
   );
 }
 
+/// REST yanitindaki satirin `name` alani istenen depo ile eslesiyor mu (trim; ASCII icin buyuk/kucuk harf yok sayilir).
+bool _sensorRowMatchesTank(Map<String, dynamic> row, String tankName) {
+  final Object? raw = row['name'];
+  if (raw == null) {
+    return false;
+  }
+  final String a = raw.toString().trim();
+  final String b = tankName.trim();
+  if (a.isEmpty || b.isEmpty) {
+    return false;
+  }
+  return a.toUpperCase() == b.toUpperCase();
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await LowTankNotifier.instance.init();
@@ -220,10 +285,18 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _loadSavedOrder();
-    _loadData();
+    _bootstrapDashboard();
     _configurePollingTimer();
     _loadPackageInfo();
+  }
+
+  /// Kayitli depo sirasi yuklendikten sonra ilk cekimi yapar (acilista siralar / veriler karismasin).
+  Future<void> _bootstrapDashboard() async {
+    await _loadSavedOrder();
+    if (!mounted) {
+      return;
+    }
+    await _loadData();
   }
 
   Future<void> _loadPackageInfo() async {
@@ -356,9 +429,10 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
         }
       }
     } catch (error) {
+      _debugLogFetchFailure('Dashboard.fetch', error);
       if (!mounted) return;
       setState(() {
-        _errorMessage = 'Veri alinirken hata olustu: $error';
+        _errorMessage = _formatSensorFetchError(error);
         _isLoading = false;
         _isFetching = false;
       });
@@ -384,27 +458,13 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
       builder: (BuildContext context, BoxConstraints constraints) {
         const double horizontalPadding = 12;
         const double topPadding = 8;
-        const double crossSpacing = 8;
+        const double listGap = 6;
         final bool hasError = _errorMessage != null;
         final double mw = constraints.maxWidth;
-        final double mh = constraints.maxHeight;
-        // Dar ekranda tek sutun; genislik arttikca iki sutun
-        final int crossAxisCount = mw >= 340 ? 2 : 1;
         final double innerW = mw - horizontalPadding * 2;
-        final double gapTotal = crossSpacing * (crossAxisCount > 1 ? crossAxisCount - 1 : 0);
-        final double tileW = (innerW - gapTotal) / crossAxisCount;
-        // Kart ic scale: dar hucrede yazi / kavanoz kuculur
-        final double cardLayoutScale = (tileW / 168).clamp(0.72, 1.0);
-        // childAspectRatio = gen / yuk — kisa ekranda daha "genis" (daha az yukseklik) hucre
-        double aspectRatio = tileW / (crossAxisCount == 1 ? 200 : 188);
-        if (mh < 620) {
-          aspectRatio *= 1.12;
-        }
-        if (mh < 520) {
-          aspectRatio *= 1.08;
-        }
-        aspectRatio = aspectRatio.clamp(0.82, 1.35);
-        final double cardWidth = tileW;
+        // Her depo tam genislik tek satir; mockup tarzi yatay kart
+        final double cardLayoutScale = (innerW / 300).clamp(0.88, 1.12);
+        final bool cardCompact = mw < 340;
 
         return RefreshIndicator(
           color: const Color(0xFF0288D1),
@@ -425,23 +485,44 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
                       horizontalPadding,
                       0,
                       horizontalPadding,
-                      6,
+                      8,
                     ),
-                    child: Text(
-                      _errorMessage!,
-                      style: const TextStyle(color: Colors.red),
+                    child: Material(
+                      color: Colors.red.shade50,
+                      borderRadius: BorderRadius.circular(12),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: <Widget>[
+                            Icon(
+                              Icons.cloud_off_rounded,
+                              color: Colors.red.shade800,
+                              size: 22,
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                _errorMessage!,
+                                style: TextStyle(
+                                  color: Colors.red.shade900,
+                                  height: 1.35,
+                                  fontSize: 13.5,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
                     ),
                   ),
                 ),
               SliverPadding(
                 padding: const EdgeInsets.symmetric(horizontal: horizontalPadding),
-                sliver: SliverGrid(
-                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: crossAxisCount,
-                    crossAxisSpacing: crossAxisCount > 1 ? crossSpacing : 0,
-                    mainAxisSpacing: 8,
-                    childAspectRatio: aspectRatio,
-                  ),
+                sliver: SliverList(
                   delegate: SliverChildBuilderDelegate(
                     (BuildContext context, int index) {
                       final String name = _tankOrder[index];
@@ -451,7 +532,7 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
                         tankName: name,
                         level: reading?.value,
                         dataReceivedAt: reading?.createdAt,
-                        compact: true,
+                        compact: cardCompact,
                         layoutScale: cardLayoutScale,
                         onDoubleTap: () {
                           Navigator.of(context).push<void>(
@@ -465,64 +546,69 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
                         },
                       );
 
-                      return DragTarget<String>(
-                        onWillAcceptWithDetails: (DragTargetDetails<String> details) =>
-                            details.data != name,
-                        onAcceptWithDetails: (DragTargetDetails<String> details) {
-                          final String dragged = details.data;
-                          final int from = _tankOrder.indexOf(dragged);
-                          final int to = _tankOrder.indexOf(name);
-                          if (from < 0 || to < 0 || from == to) return;
-                          setState(() {
-                            final String moved = _tankOrder.removeAt(from);
-                            _tankOrder.insert(to, moved);
-                            _draggingTankName = null;
-                          });
-                          _saveOrder();
-                        },
-                        builder: (
-                          BuildContext context,
-                          List<String?> candidateData,
-                          List<dynamic> rejectedData,
-                        ) {
-                          return LongPressDraggable<String>(
-                            data: name,
-                            delay: const Duration(milliseconds: 220),
-                            onDragStarted: () {
-                              setState(() {
-                                _draggingTankName = name;
-                              });
-                            },
-                            onDragEnd: (_) {
-                              if (!mounted) return;
-                              setState(() {
-                                _draggingTankName = null;
-                              });
-                            },
-                            feedback: Material(
-                              color: Colors.transparent,
-                              child: SizedBox(
-                                width: cardWidth,
-                                child: Opacity(
-                                  opacity: 0.94,
-                                  child: _TankCard(
-                                    tankName: name,
-                                    level: reading?.value,
-                                    dataReceivedAt: reading?.createdAt,
-                                    compact: true,
-                                    layoutScale: cardLayoutScale,
+                      return Padding(
+                        padding: EdgeInsets.only(
+                          bottom: index < _tankOrder.length - 1 ? listGap : 0,
+                        ),
+                        child: DragTarget<String>(
+                          onWillAcceptWithDetails: (DragTargetDetails<String> details) =>
+                              details.data != name,
+                          onAcceptWithDetails: (DragTargetDetails<String> details) {
+                            final String dragged = details.data;
+                            final int from = _tankOrder.indexOf(dragged);
+                            final int to = _tankOrder.indexOf(name);
+                            if (from < 0 || to < 0 || from == to) return;
+                            setState(() {
+                              final String moved = _tankOrder.removeAt(from);
+                              _tankOrder.insert(to, moved);
+                              _draggingTankName = null;
+                            });
+                            _saveOrder();
+                          },
+                          builder: (
+                            BuildContext context,
+                            List<String?> candidateData,
+                            List<dynamic> rejectedData,
+                          ) {
+                            return LongPressDraggable<String>(
+                              data: name,
+                              delay: const Duration(milliseconds: 220),
+                              onDragStarted: () {
+                                setState(() {
+                                  _draggingTankName = name;
+                                });
+                              },
+                              onDragEnd: (_) {
+                                if (!mounted) return;
+                                setState(() {
+                                  _draggingTankName = null;
+                                });
+                              },
+                              feedback: Material(
+                                color: Colors.transparent,
+                                child: SizedBox(
+                                  width: innerW,
+                                  child: Opacity(
+                                    opacity: 0.94,
+                                    child: _TankCard(
+                                      tankName: name,
+                                      level: reading?.value,
+                                      dataReceivedAt: reading?.createdAt,
+                                      compact: cardCompact,
+                                      layoutScale: cardLayoutScale,
+                                    ),
                                   ),
                                 ),
                               ),
-                            ),
-                            childWhenDragging: Opacity(opacity: 0.35, child: card),
-                            child: AnimatedScale(
-                              scale: _draggingTankName == name ? 0.98 : 1,
-                              duration: const Duration(milliseconds: 120),
-                              child: card,
-                            ),
-                          );
-                        },
+                              childWhenDragging: Opacity(opacity: 0.35, child: card),
+                              child: AnimatedScale(
+                                scale: _draggingTankName == name ? 0.98 : 1,
+                                duration: const Duration(milliseconds: 120),
+                                child: card,
+                              ),
+                            );
+                          },
+                        ),
                       );
                     },
                     childCount: _tankOrder.length,
@@ -542,7 +628,7 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   }) {
     final String lastUpdateText = _lastUpdate == null
         ? 'Henuz veri yok'
-        : 'Son guncelleme: ${_formatDateTime(_lastUpdate!)}';
+        : 'Son guncelleme: ${_formatRelativeSensorAge(_lastUpdate!)}';
     final TextScaler scaler = MediaQuery.textScalerOf(context);
     final double titleFs = scaler.scale(18).clamp(14, 22);
     final double subtitleFs = scaler.scale(15).clamp(12, 18);
@@ -652,6 +738,74 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   }
 }
 
+/// Depo durumu: mockup tarzi `[OK]` etiketi + sag buyuk ikon (veri Supabase doluluk).
+({String badge, IconData icon}) _tankUiStatus(int? level) {
+  if (level == null) {
+    return (badge: 'VERİ YOK', icon: Icons.cloud_off_rounded);
+  }
+  final int v = level.clamp(0, 100);
+  if (v >= 34) {
+    return (badge: 'OK', icon: Icons.water_drop_rounded);
+  }
+  if (v >= 1) {
+    return (badge: 'KRİTİK UYARI', icon: Icons.warning_amber_rounded);
+  }
+  return (badge: 'ACİL', icon: Icons.emergency_rounded);
+}
+
+String _compactBracketBadge(String badge, bool compact) {
+  if (!compact) {
+    return badge;
+  }
+  if (badge == 'KRİTİK UYARI') {
+    return 'KRİTİK';
+  }
+  return badge;
+}
+
+class _BracketStatusBadge extends StatelessWidget {
+  const _BracketStatusBadge({
+    required this.label,
+    required this.accent,
+    required this.compact,
+    required this.scaler,
+  });
+
+  final String label;
+  final Color accent;
+  final bool compact;
+  final TextScaler scaler;
+
+  @override
+  Widget build(BuildContext context) {
+    final double fs = scaler.scale((compact ? 10 : 11)).clamp(9, 13);
+    return Container(
+      constraints: BoxConstraints(maxWidth: compact ? 104 : 168),
+      padding: EdgeInsets.symmetric(
+        horizontal: (compact ? 7 : 9),
+        vertical: 4,
+      ),
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: accent.withValues(alpha: 0.38)),
+      ),
+      child: Text(
+        '[$label]',
+        textAlign: TextAlign.center,
+        style: TextStyle(
+          color: accent,
+          fontWeight: FontWeight.w800,
+          fontSize: fs,
+          height: 1.15,
+        ),
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      ),
+    );
+  }
+}
+
 class _TankCard extends StatelessWidget {
   const _TankCard({
     super.key,
@@ -675,408 +829,481 @@ class _TankCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final TextScaler scaler = MediaQuery.textScalerOf(context);
     final double ls = layoutScale;
-    final double pad = (14 * ls).clamp(8, 14);
-    final double titleFs = scaler.scale((compact ? 15 : 17) * ls).clamp(11, 20);
-    final double pctFs = scaler.scale((compact ? 18 : 28) * ls).clamp(14, 32);
-    final double metaFs = scaler.scale((compact ? 10.5 : 11.5) * ls).clamp(9, 14);
-    final double gaugeH = ((compact ? 86 : 170) * ls).clamp(56, 170);
+    final double pad = (10 * ls).clamp(7, 13);
+    final double titleFs = scaler.scale((compact ? 15 : 17) * ls).clamp(13, 20);
+    final double overlayPctFs =
+        scaler.scale((compact ? 17.5 : 21.5) * ls).clamp(14, 26);
+    // Son kayit: %%'den her zaman kucuk, ama onceki sabit metadan daha buyuk
+    final double metaFs =
+        (overlayPctFs * 0.91).clamp(12.5, overlayPctFs - 0.5);
+    final double bandH = scaler.scale((compact ? 52 : 58) * ls).clamp(46.0, 72.0);
 
     final bool noData = level == null;
     final int safeLevel = noData ? 0 : level!.clamp(0, 100);
-    final Color barColor = noData ? const Color(0xFF78909C) : _colorForLevel(safeLevel);
-    final IconData statusIcon = _iconForLevel(level);
-    final Color accentColor = barColor;
+    final Color barColor =
+        noData ? const Color(0xFF6C757D) : _colorForLevel(safeLevel);
+    final Color vivid =
+        noData ? const Color(0xFF6C757D) : _gaugeChromaBoost(barColor);
+
+    final ({String badge, IconData icon}) status = _tankUiStatus(level);
+    final String badgeLabel = _compactBracketBadge(status.badge, compact);
+
+    final Color titleColor =
+        noData ? const Color(0xFF546E7A) : const Color(0xFF102027);
+
+    final double iconCol =
+        scaler.scale((compact ? 36 : 44) * ls).clamp(32, 52);
+    final double iconSize =
+        scaler.scale((compact ? 28 : 34) * ls).clamp(24, 44);
 
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onDoubleTap: onDoubleTap,
-      child: Container(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(18),
-          gradient: LinearGradient(
-            colors: <Color>[
-              accentColor.withValues(alpha: 0.24),
-              barColor.withValues(alpha: 0.18),
-              Colors.white,
-            ],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-          ),
-          boxShadow: <BoxShadow>[
-            BoxShadow(
-              color: accentColor.withValues(alpha: 0.28),
-              blurRadius: 16,
-              offset: const Offset(0, 8),
-            ),
-          ],
-          border: Border.all(color: accentColor.withValues(alpha: 0.55), width: 1.2),
-        ),
-        child: Padding(
-          padding: EdgeInsets.all(pad),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: <Widget>[
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Container(
-                    width: ((compact ? 36 : 40) * ls).clamp(28, 44),
-                    height: ((compact ? 36 : 40) * ls).clamp(28, 44),
-                    decoration: BoxDecoration(
-                      color: accentColor.withValues(alpha: 0.2),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Icon(
-                      statusIcon,
-                      color: accentColor,
-                      size: scaler.scale((compact ? 20 : 22) * ls).clamp(16, 24),
-                    ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(18),
+        child: Stack(
+          clipBehavior: Clip.hardEdge,
+          children: <Widget>[
+            Positioned.fill(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: <Color>[
+                      Colors.white,
+                      Color.lerp(Colors.white, Colors.blueGrey.shade50, 0.65)!,
+                    ],
                   ),
-                  SizedBox(width: (compact ? 8 : 10) * ls),
-                  Expanded(
-                    child: Text(
-                      tankName,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      softWrap: true,
-                      style: TextStyle(
-                        fontSize: titleFs,
-                        fontWeight: FontWeight.w700,
-                        height: 1.2,
-                        letterSpacing: -0.2,
-                        color: const Color(0xFF1A237E),
+                  border: Border.all(color: Colors.grey.shade300),
+                  boxShadow: <BoxShadow>[
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.07),
+                      blurRadius: 12,
+                      offset: const Offset(0, 4),
+                      spreadRadius: 0,
+                    ),
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.045),
+                      blurRadius: 22,
+                      offset: const Offset(0, 10),
+                    ),
+                    // Alt kenarda hafif derinlik (ince golge cizgisi)
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.065),
+                      blurRadius: 8,
+                      offset: const Offset(0, 5),
+                      spreadRadius: -3,
+                    ),
+                    if (!noData)
+                      BoxShadow(
+                        color: vivid.withValues(alpha: 0.16),
+                        blurRadius: 28,
+                        offset: const Offset(0, 10),
+                        spreadRadius: -4,
                       ),
+                  ],
+                ),
+              ),
+            ),
+            Positioned(
+              left: 0,
+              top: 0,
+              bottom: 0,
+              width: 4,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: <Color>[
+                      vivid.withValues(alpha: noData ? 0.35 : 0.5),
+                      vivid.withValues(alpha: noData ? 0.15 : 0.28),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              right: 0,
+              top: 0,
+              bottom: 0,
+              width: 5,
+              child: DecoratedBox(
+                decoration: BoxDecoration(color: vivid),
+              ),
+            ),
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              height: 18,
+              child: IgnorePointer(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    borderRadius: const BorderRadius.vertical(
+                      bottom: Radius.circular(18),
+                    ),
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: <Color>[
+                        Colors.transparent,
+                        Colors.black.withValues(alpha: 0.045),
+                      ],
                     ),
                   ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: EdgeInsets.fromLTRB(pad + 5, pad, pad + 10, pad),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      Expanded(
+                        child: Text(
+                          tankName,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          softWrap: true,
+                          style: TextStyle(
+                            fontSize: titleFs,
+                            fontWeight: FontWeight.w800,
+                            height: 1.15,
+                            letterSpacing: -0.35,
+                            color: titleColor,
+                          ),
+                        ),
+                      ),
+                      SizedBox(width: 8 * ls),
+                      _BracketStatusBadge(
+                        label: badgeLabel,
+                        accent: vivid,
+                        compact: compact,
+                        scaler: scaler,
+                      ),
+                    ],
+                  ),
+                  SizedBox(height: (compact ? 8 : 10) * ls),
                   SizedBox(
-                    width: ((compact ? 34 : 38) * ls).clamp(28, 42),
-                    child: Align(
-                      alignment: Alignment.topCenter,
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          color: barColor.withValues(alpha: 0.12),
-                          borderRadius: BorderRadius.circular(10),
+                    height: bandH,
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: <Widget>[
+                        _WaterTankIllustration(
+                          safeLevel: safeLevel,
+                          barColor: barColor,
+                          vivid: vivid,
+                          noData: noData,
                         ),
-                        child: Padding(
-                          padding: EdgeInsets.all((6 * ls).clamp(4, 8)),
-                          child: Icon(
-                            Icons.water_drop_rounded,
-                            color: barColor,
-                            size: scaler.scale((compact ? 17 : 18) * ls).clamp(14, 20),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              if (dataReceivedAt != null) ...<Widget>[
-                SizedBox(height: (compact ? 4 : 6) * ls),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Padding(
-                      padding: const EdgeInsets.only(top: 1),
-                      child: Icon(
-                        Icons.schedule_rounded,
-                        size: metaFs + 1,
-                        color: Colors.black45,
-                      ),
-                    ),
-                    SizedBox(width: 5 * ls),
-                    Expanded(
-                      child: Text(
-                        'Son kayit: ${_formatRelativeSensorAge(dataReceivedAt!)}',
-                        style: TextStyle(
-                          fontSize: metaFs,
-                          height: 1.15,
-                          color: Colors.black.withValues(alpha: 0.52),
-                          fontWeight: FontWeight.w500,
-                        ),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-              SizedBox(height: (compact ? 8 : 12) * ls),
-              SizedBox(
-                height: gaugeH,
-                child: Row(
-                  children: <Widget>[
-                    Expanded(
-                      child: Center(
-                        child: FittedBox(
-                          fit: BoxFit.scaleDown,
-                          child: Text(
-                            noData ? 'Veri yok' : '%$safeLevel',
-                            textAlign: TextAlign.center,
-                            maxLines: 1,
-                            style: TextStyle(
-                              fontSize: pctFs,
-                              fontWeight: FontWeight.bold,
-                              height: 1,
-                              color: noData ? Colors.blueGrey.shade700 : null,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                    _WaterJarLinearGauge(
-                      compact: compact,
-                      layoutScale: ls,
-                      level: level,
-                      safeLevel: safeLevel,
-                      barColor: barColor,
-                      heightOverride: gaugeH,
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _WaterJarLinearGauge extends StatelessWidget {
-  const _WaterJarLinearGauge({
-    required this.compact,
-    required this.layoutScale,
-    required this.level,
-    required this.safeLevel,
-    required this.barColor,
-    required this.heightOverride,
-  });
-
-  final bool compact;
-  final double layoutScale;
-  final int? level;
-  final int safeLevel;
-  final Color barColor;
-  final double heightOverride;
-
-  @override
-  Widget build(BuildContext context) {
-    final double ls = layoutScale;
-    final double jarWidth = ((compact ? 60 : 76) * ls).clamp(44, 80);
-    final double gaugeThickness = ((compact ? 24 : 30) * ls).clamp(18, 32);
-    final double totalHeight = heightOverride;
-    final double neckHeight = ((compact ? 5 : 6) * ls).clamp(3, 8);
-    final double neckGap = (3 * ls).clamp(2, 4);
-    final double baseGap = (4 * ls).clamp(2, 5);
-    final double baseHeight = ((compact ? 7 : 8) * ls).clamp(5, 10);
-    final double bodyHeight = math.max(
-      32,
-      totalHeight - neckHeight - neckGap - baseGap - baseHeight,
-    );
-
-    return SizedBox(
-      width: jarWidth,
-      height: totalHeight,
-      child: Column(
-        mainAxisSize: MainAxisSize.max,
-        children: <Widget>[
-          // Hafif "boyun" hissi
-          Container(
-            width: jarWidth * 0.52,
-            height: neckHeight,
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.45),
-              borderRadius: BorderRadius.circular(999),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.55),
-                width: 1.1,
-              ),
-            ),
-          ),
-          SizedBox(height: neckGap),
-          SizedBox(
-            height: bodyHeight,
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(22),
-                gradient: LinearGradient(
-                  colors: <Color>[
-                    Colors.white.withValues(alpha: 0.62),
-                    Colors.white.withValues(alpha: 0.14),
-                  ],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-                border: Border.all(
-                  color: Colors.white.withValues(alpha: 0.72),
-                  width: 1.8,
-                ),
-                boxShadow: <BoxShadow>[
-                  BoxShadow(
-                    color: barColor.withValues(alpha: 0.24),
-                    blurRadius: 14,
-                    offset: const Offset(0, 8),
-                  ),
-                ],
-              ),
-              child: Stack(
-                children: <Widget>[
-                  Positioned.fill(
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(7, 8, 7, 10),
-                      child: LayoutBuilder(
-                        builder: (BuildContext context, BoxConstraints _) {
-                          final double fill =
-                              level == null ? 0 : (safeLevel / 100).clamp(0, 1);
-
-                          return Stack(
-                            alignment: Alignment.center,
-                            children: <Widget>[
-                              Positioned.fill(
-                                child: SfLinearGauge(
-                                  minimum: 0,
-                                  maximum: 100,
-                                  orientation: LinearGaugeOrientation.vertical,
-                                  isAxisInversed: false,
-                                  showTicks: false,
-                                  showLabels: false,
-                                  axisTrackStyle: LinearAxisTrackStyle(
-                                    thickness: gaugeThickness,
-                                    edgeStyle: LinearEdgeStyle.bothCurve,
-                                    color: Colors.grey.shade300,
-                                  ),
-                                  barPointers: <LinearBarPointer>[
-                                    LinearBarPointer(
-                                      value: level == null ? 0 : safeLevel.toDouble(),
-                                      thickness: gaugeThickness,
-                                      edgeStyle: LinearEdgeStyle.bothCurve,
-                                      color: barColor,
-                                      enableAnimation: false,
+                        SizedBox(width: (compact ? 8 : 12) * ls),
+                        Expanded(
+                          child: Align(
+                            alignment: Alignment.centerLeft,
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.center,
+                              children: <Widget>[
+                                if (noData)
+                                  Text(
+                                    'Veri yok',
+                                    style: TextStyle(
+                                      fontSize: scaler
+                                          .scale((compact ? 11.5 : 12.5) * ls)
+                                          .clamp(10, 14),
+                                      fontWeight: FontWeight.w600,
+                                      color: const Color(0xFF6C757D),
                                     ),
-                                  ],
-                                ),
-                              ),
-                              Positioned.fill(
-                                child: CustomPaint(
-                                  painter: _JarWavePainter(
-                                    fillFraction: fill,
-                                    phase: 0,
-                                    waterColor: barColor,
-                                  ),
-                                ),
-                              ),
-                              // Cam parlama cizgisi
-                              Positioned(
-                                left: 7,
-                                top: 10,
-                                bottom: 12,
-                                child: IgnorePointer(
-                                  child: Container(
-                                    width: 4,
-                                    decoration: BoxDecoration(
-                                      borderRadius: BorderRadius.circular(999),
-                                      gradient: LinearGradient(
-                                        colors: <Color>[
-                                          Colors.white.withValues(alpha: 0.55),
-                                          Colors.white.withValues(alpha: 0.0),
-                                        ],
-                                        begin: Alignment.topCenter,
-                                        end: Alignment.bottomCenter,
+                                  )
+                                else
+                                  FittedBox(
+                                    fit: BoxFit.scaleDown,
+                                    alignment: Alignment.centerLeft,
+                                    child: Text(
+                                      '%$safeLevel',
+                                      style: TextStyle(
+                                        fontSize: overlayPctFs,
+                                        fontWeight: FontWeight.w600,
+                                        height: 1.05,
+                                        letterSpacing: -0.15,
+                                        color: Color.lerp(
+                                          barColor,
+                                          const Color(0xFF37474F),
+                                          0.22,
+                                        )!,
                                       ),
                                     ),
                                   ),
+                                SizedBox(width: (compact ? 8 : 10) * ls),
+                                Icon(
+                                  Icons.schedule_rounded,
+                                  size: scaler
+                                      .scale((compact ? 13 : 14) * ls)
+                                      .clamp(12, 17),
+                                  color: Colors.grey.shade600,
                                 ),
-                              ),
-                            ],
-                          );
-                        },
-                      ),
+                                SizedBox(width: 4 * ls),
+                                Expanded(
+                                  child: Text(
+                                    dataReceivedAt == null
+                                        ? 'bekleniyor'
+                                        : _formatRelativeSensorAge(
+                                            dataReceivedAt!,
+                                          ),
+                                    style: TextStyle(
+                                      fontSize: metaFs,
+                                      height: 1.2,
+                                      color: noData
+                                          ? Colors.blueGrey.shade600
+                                          : Colors.grey.shade800,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        SizedBox(width: (compact ? 4 : 8) * ls),
+                        SizedBox(
+                          width: iconCol,
+                          child: Center(
+                            child: Icon(
+                              status.icon,
+                              color: vivid,
+                              size: iconSize,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ],
               ),
             ),
-          ),
-          SizedBox(height: baseGap),
-          // Taban
-          Container(
-            width: jarWidth * 0.78,
-            height: baseHeight,
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.35),
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.55),
-                width: 1.1,
-              ),
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
 }
 
-class _JarWavePainter extends CustomPainter {
-  _JarWavePainter({
+/// Ince mockup deposu (yalnizca silindir cizimi; %% ve son kayit ust kartta).
+class _WaterTankIllustration extends StatelessWidget {
+  const _WaterTankIllustration({
+    required this.safeLevel,
+    required this.barColor,
+    required this.vivid,
+    required this.noData,
+  });
+
+  final int safeLevel;
+  final Color barColor;
+  final Color vivid;
+  final bool noData;
+
+  @override
+  Widget build(BuildContext context) {
+    final double fillT =
+        noData ? 0.0 : (safeLevel / 100.0).clamp(0.0, 1.0);
+
+    final Color lt = noData
+        ? const Color(0xFFCFD8DC)
+        : Color.lerp(barColor, Colors.white, 0.2)!;
+    final Color lm = noData ? const Color(0xFFB0BEC5) : barColor;
+    final Color lb = noData
+        ? const Color(0xFF90A4AE)
+        : Color.lerp(barColor, const Color(0xFF050505), 0.26)!;
+
+    final Color strokeCol =
+        noData ? Colors.blueGrey.shade400 : vivid.withValues(alpha: 0.88);
+    final Color chamberBg = noData
+        ? const Color(0xFFECEFF1)
+        : Color.lerp(const Color(0xFFE8F4FC), barColor, 0.14)!;
+
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final double maxH = constraints.hasBoundedHeight && constraints.maxHeight > 8
+            ? constraints.maxHeight
+            : 96.0;
+        final double tankW = (maxH * 0.30).clamp(34.0, 52.0);
+
+        return SizedBox(
+          width: tankW,
+          height: maxH,
+          child: CustomPaint(
+            painter: _WaterTankPainter(
+              fillFraction: fillT,
+              liquidTop: lt,
+              liquidMid: lm,
+              liquidBot: lb,
+              noData: noData,
+              strokeColor: strokeCol,
+              chamberBg: chamberBg,
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _WaterTankPainter extends CustomPainter {
+  _WaterTankPainter({
     required this.fillFraction,
-    required this.phase,
-    required this.waterColor,
+    required this.liquidTop,
+    required this.liquidMid,
+    required this.liquidBot,
+    required this.noData,
+    required this.strokeColor,
+    required this.chamberBg,
   });
 
   final double fillFraction;
-  final double phase;
-  final Color waterColor;
+  final Color liquidTop;
+  final Color liquidMid;
+  final Color liquidBot;
+  final bool noData;
+  final Color strokeColor;
+  final Color chamberBg;
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (fillFraction <= 0.001) return;
-
-    final double h = size.height;
     final double w = size.width;
-    final double surfaceY = h * (1 - fillFraction);
+    final double h = size.height;
+    // Ince sutunda govdeyi kanali dolduracak sekilde (mockup silindir).
+    final double tw = w * 0.88;
+    final double left = (w - tw) / 2;
+    final double top = h * 0.06;
+    final double bottom = h * 0.94;
 
-    final Path wavePath = Path()..moveTo(0, surfaceY);
-    const int segments = 18;
-    for (int i = 0; i <= segments; i++) {
-      final double t = i / segments;
-      final double x = t * w;
-      final double wave =
-          1.6 * (0.5 + 0.5 * (1 - fillFraction)) * math.sin((t * 2 * math.pi) + (phase * 2 * math.pi));
-      wavePath.lineTo(x, surfaceY + wave);
+    final double filletTop = (tw * 0.42).clamp(12.0, 26.0);
+    final double filletBot = (tw * 0.17).clamp(6.0, 13.0);
+    final RRect outer = RRect.fromLTRBAndCorners(
+      left,
+      top,
+      left + tw,
+      bottom,
+      topLeft: Radius.circular(filletTop),
+      topRight: Radius.circular(filletTop),
+      bottomLeft: Radius.circular(filletBot),
+      bottomRight: Radius.circular(filletBot),
+    );
+
+    final RRect inner = outer.deflate(w < 46 ? 3.5 : 4.5);
+
+    canvas.drawRRect(
+      outer,
+      Paint()
+        ..shader = LinearGradient(
+          colors: <Color>[
+            strokeColor.withValues(alpha: noData ? 0.35 : 0.52),
+            strokeColor.withValues(alpha: noData ? 0.12 : 0.22),
+          ],
+          begin: Alignment.centerLeft,
+          end: Alignment.centerRight,
+        ).createShader(outer.outerRect),
+    );
+
+    canvas.drawRRect(inner, Paint()..color = chamberBg);
+
+    if (!noData && fillFraction > 0.008) {
+      canvas.save();
+      canvas.clipRRect(inner);
+      final double surfY = inner.bottom - inner.height * fillFraction;
+      final Rect liq = Rect.fromLTRB(
+        inner.left,
+        surfY,
+        inner.right,
+        inner.bottom,
+      );
+      canvas.drawRect(
+        liq,
+        Paint()
+          ..shader = LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: <Color>[liquidTop, liquidMid, liquidBot],
+            stops: const <double>[0.0, 0.45, 1.0],
+          ).createShader(liq),
+      );
+      canvas.drawLine(
+        Offset(inner.left, surfY),
+        Offset(inner.right, surfY),
+        Paint()
+          ..color = Colors.white.withValues(alpha: 0.65)
+          ..strokeWidth = 2,
+      );
+      canvas.restore();
     }
-    wavePath.lineTo(w, h);
-    wavePath.lineTo(0, h);
-    wavePath.close();
 
-    final Paint fillPaint = Paint()
-      ..shader = LinearGradient(
-        colors: <Color>[
-          waterColor.withValues(alpha: 0.22),
-          waterColor.withValues(alpha: 0.08),
-        ],
-        begin: Alignment.topCenter,
-        end: Alignment.bottomCenter,
-      ).createShader(Rect.fromLTWH(0, surfaceY, w, h - surfaceY))
+    // Gosterge cizgileri (ic)
+    final Paint grid = Paint()
+      ..color = Colors.black.withValues(alpha: noData ? 0.06 : 0.1)
+      ..strokeWidth = 1;
+    for (int i = 1; i < 4; i++) {
+      final double y = inner.top + inner.height * i / 4;
+      canvas.drawLine(
+        Offset(inner.left + 3, y),
+        Offset(inner.right - 3, y),
+        grid,
+      );
+    }
+
+    canvas.drawRRect(
+      inner,
+      Paint()
+        ..color = strokeColor.withValues(alpha: noData ? 0.55 : 0.85)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = noData ? 1.8 : 2.2,
+    );
+
+    final double footW = tw * 0.14;
+    final double fh = h * 0.035;
+    final Paint foot = Paint()
+      ..color = strokeColor.withValues(alpha: 0.55)
       ..style = PaintingStyle.fill;
-
-    canvas.drawPath(wavePath, fillPaint);
-
-    final Paint foam = Paint()
-      ..color = Colors.white.withValues(alpha: 0.22)
-      ..strokeWidth = 1.4
-      ..style = PaintingStyle.stroke;
-    canvas.drawPath(wavePath, foam);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTRB(left + tw * 0.18, bottom, left + tw * 0.18 + footW, bottom + fh),
+        Radius.circular(3),
+      ),
+      foot,
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTRB(left + tw * 0.68, bottom, left + tw * 0.68 + footW, bottom + fh),
+        Radius.circular(3),
+      ),
+      foot,
+    );
   }
 
   @override
-  bool shouldRepaint(covariant _JarWavePainter oldDelegate) {
+  bool shouldRepaint(covariant _WaterTankPainter oldDelegate) {
     return oldDelegate.fillFraction != fillFraction ||
-        oldDelegate.phase != phase ||
-        oldDelegate.waterColor != waterColor;
+        oldDelegate.noData != noData ||
+        oldDelegate.liquidTop != liquidTop ||
+        oldDelegate.liquidMid != liquidMid ||
+        oldDelegate.liquidBot != liquidBot ||
+        oldDelegate.strokeColor != strokeColor ||
+        oldDelegate.chamberBg != chamberBg;
   }
 }
+
+/// Depo göstergesinde [barColor] tonunu hafifçe canlandırır; eşik renklerini birbirine yakınsatmaz.
+Color _gaugeChromaBoost(Color c) {
+  final HSVColor h = HSVColor.fromColor(c);
+  final double s = (h.saturation * 1.08 + 0.02).clamp(0.0, 1.0);
+  final double v = (h.value * 1.03).clamp(0.0, 1.0);
+  return HSVColor.fromAHSV(c.a, h.hue, s, v).toColor();
+}
+
 
 class TankReading {
   const TankReading({
@@ -1143,9 +1370,10 @@ class _TankWeeklyChartPageState extends State<TankWeeklyChartPage> {
         _loading = false;
       });
     } catch (e) {
+      _debugLogFetchFailure('Chart7d.${widget.tankName}', e);
       if (!mounted) return;
       setState(() {
-        _error = e.toString();
+        _error = _formatSensorFetchError(e);
         _loading = false;
       });
     }
@@ -1175,10 +1403,32 @@ class _TankWeeklyChartPageState extends State<TankWeeklyChartPage> {
                     ? Center(
                         child: Padding(
                           padding: const EdgeInsets.all(24),
-                          child: Text(
-                            _error!,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(color: Colors.red),
+                          child: Material(
+                            color: Colors.red.shade50,
+                            borderRadius: BorderRadius.circular(12),
+                            child: Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: <Widget>[
+                                  Icon(
+                                    Icons.cloud_off_rounded,
+                                    color: Colors.red.shade800,
+                                    size: 40,
+                                  ),
+                                  const SizedBox(height: 12),
+                                  Text(
+                                    _error!,
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      color: Colors.red.shade900,
+                                      height: 1.4,
+                                      fontSize: 14,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
                           ),
                         ),
                       )
@@ -1376,8 +1626,9 @@ class SupabaseSensorClient {
           )
           .timeout(requestTimeout);
     } on TimeoutException {
-      throw Exception(
-        'Supabase istegi zaman asimina ugradi (${requestTimeout.inSeconds}s): $uri',
+      throw TimeoutException(
+        'Supabase istegi zaman asimina ugradi (${requestTimeout.inSeconds}s)',
+        requestTimeout,
       );
     }
   }
@@ -1393,13 +1644,18 @@ class SupabaseSensorClient {
     for (int i = 0; i < tankNames.length; i++) {
       final TankReading? r = rows[i];
       if (r != null) {
-        latest[r.name] = r;
+        latest[tankNames[i]] = TankReading(
+          name: tankNames[i],
+          value: r.value,
+          createdAt: r.createdAt,
+        );
       }
     }
     return latest;
   }
 
-  /// Tek depo: `name=eq.<tank>` + en yeni satir (`limit=1`).
+  /// En yeni satir `value=null` (stale) olsa bile, son sayisal doluluk varsa onu gosterir.
+  /// Tek HTTP: son N satir taranir (PostgREST `not.is.null` tip uyumsuzlugundan kacinmak icin).
   Future<TankReading?> _fetchLatestSingleForTank(String tankName) async {
     final Uri base = Uri.parse(endpoint);
     final Uri uri = base.replace(
@@ -1407,16 +1663,19 @@ class SupabaseSensorClient {
         'select': 'name,value,created_at',
         'name': 'eq.$tankName',
         'order': 'created_at.desc',
-        'limit': '1',
+        'limit': '40',
       },
     );
 
     final http.Response response = await _getWithTimeout(uri);
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception(
-        'Supabase ($tankName) basarisiz: ${response.statusCode} ${response.body}',
-      );
+      if (kDebugMode) {
+        debugPrint(
+          'Supabase ($tankName) HTTP ${response.statusCode} ${response.body}',
+        );
+      }
+      throw Exception('HTTP ${response.statusCode}');
     }
 
     final dynamic decoded = jsonDecode(response.body);
@@ -1426,27 +1685,47 @@ class SupabaseSensorClient {
     if (decoded.isEmpty) {
       return null;
     }
-    return _tankReadingFromRow(decoded.first);
+    final List<Map<String, dynamic>> matching = <Map<String, dynamic>>[];
+    for (final dynamic row in decoded) {
+      if (row is! Map) {
+        continue;
+      }
+      final Map<String, dynamic> m = Map<String, dynamic>.from(row);
+      if (_sensorRowMatchesTank(m, tankName)) {
+        matching.add(m);
+      }
+    }
+    if (matching.isEmpty) {
+      if (kDebugMode && decoded.isNotEmpty) {
+        debugPrint(
+          'Supabase ($tankName): gelen ${decoded.length} satirda name="$tankName" '
+          'eslesmedi; bu depo icin veri yok.',
+        );
+      }
+      return null;
+    }
+    for (final Map<String, dynamic> m in matching) {
+      final TankReading? r = _tankReadingFromRow(m, displayName: tankName);
+      if (r != null && r.value != null) {
+        return r;
+      }
+    }
+    return _tankReadingFromRow(matching.first, displayName: tankName);
   }
 
-  TankReading? _tankReadingFromRow(dynamic raw) {
-    if (raw is! Map<String, dynamic>) {
+  TankReading? _tankReadingFromRow(dynamic raw, {required String displayName}) {
+    if (raw is! Map) {
       return null;
     }
-    final Map<String, dynamic> row = raw;
-    final String? name = row['name']?.toString();
-    if (name == null) {
-      return null;
-    }
+    final Map<String, dynamic> row = Map<String, dynamic>.from(raw);
     final int? value = _parseSensorJsonValue(row['value']);
     final DateTime? createdAt = _parseCreatedAtUtc(row['created_at']);
-    if (createdAt == null) {
-      return null;
-    }
+    // created_at parse edilemezse karti tamamen dusurmeyelim
+    final DateTime stamp = createdAt ?? DateTime.now().toUtc();
     return TankReading(
-      name: name,
+      name: displayName,
       value: value,
-      createdAt: createdAt,
+      createdAt: stamp,
     );
   }
 
@@ -1465,9 +1744,12 @@ class SupabaseSensorClient {
     final http.Response response = await _getWithTimeout(uri);
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception(
-        'Supabase yaniti basarisiz: ${response.statusCode} ${response.body}',
-      );
+      if (kDebugMode) {
+        debugPrint(
+          'Supabase chart HTTP ${response.statusCode} ${response.body}',
+        );
+      }
+      throw Exception('HTTP ${response.statusCode}');
     }
 
     final dynamic decoded = jsonDecode(response.body);
@@ -1478,9 +1760,15 @@ class SupabaseSensorClient {
     final Map<String, TankDailyPoint> bestByDay = <String, TankDailyPoint>{};
 
     for (final dynamic row in decoded) {
-      if (row is! Map<String, dynamic>) continue;
-      final int? value = _parseSensorJsonValue(row['value']);
-      final DateTime? createdAtUtc = _parseCreatedAtUtc(row['created_at']);
+      if (row is! Map) {
+        continue;
+      }
+      final Map<String, dynamic> m = Map<String, dynamic>.from(row);
+      if (!_sensorRowMatchesTank(m, tankName)) {
+        continue;
+      }
+      final int? value = _parseSensorJsonValue(m['value']);
+      final DateTime? createdAtUtc = _parseCreatedAtUtc(m['created_at']);
       if (createdAtUtc == null) {
         continue;
       }
@@ -1523,16 +1811,6 @@ class SupabaseSensorClient {
   }
 }
 
-String _formatDateTime(DateTime dateTime) {
-  final String twoDigitMonth = dateTime.month.toString().padLeft(2, '0');
-  final String twoDigitDay = dateTime.day.toString().padLeft(2, '0');
-  final String twoDigitHour = dateTime.hour.toString().padLeft(2, '0');
-  final String twoDigitMinute = dateTime.minute.toString().padLeft(2, '0');
-  final String twoDigitSecond = dateTime.second.toString().padLeft(2, '0');
-  return '$twoDigitDay.$twoDigitMonth.${dateTime.year} '
-      '$twoDigitHour:$twoDigitMinute:$twoDigitSecond';
-}
-
 /// Depo karti: son kaydin ne kadar once geldigi (yaklasik; parent yenilenene kadar).
 /// Karsilastirma UTC'de: cihaz / yaz saati farklari anlik suresi bozmaz.
 String _formatRelativeSensorAge(DateTime receivedAt) {
@@ -1572,23 +1850,23 @@ String _formatRelativeSensorAge(DateTime receivedAt) {
 }
 
 Color _colorForLevel(int level) {
-  // 100: koyu mavi, 66: acik mavi/turkuaz, 33: turuncu, 0: kirmizi
-  if (level >= 84) return const Color(0xFF0D47A1);
-  if (level >= 50) return const Color(0xFF00BCD4);
-  if (level >= 17) return const Color(0xFFFF9800);
-  return const Color(0xFFD50000);
+  // Dolu >=67 #007BFF; Normal 34–66 #00BFFF; Kritik 1–33 #FFC107; Boş 0 #DC3545; veri yok #6C757D
+  final int v = level.clamp(0, 100);
+  if (v >= 67) {
+    return const Color(0xFF007BFF);
+  }
+  if (v >= 34) {
+    return const Color(0xFF00BFFF);
+  }
+  if (v >= 1) {
+    return const Color(0xFFFFC107);
+  }
+  return const Color(0xFFDC3545);
 }
 
 Color _colorForNullableLevel(int? level) {
   if (level == null) {
-    return const Color(0xFF78909C);
+    return const Color(0xFF6C757D);
   }
   return _colorForLevel(level);
-}
-
-IconData _iconForLevel(int? level) {
-  if (level == null) return Icons.water_drop_outlined;
-  if (level >= 66) return Icons.check_circle_outline;
-  if (level >= 33) return Icons.warning_amber_rounded;
-  return Icons.error_outline;
 }
