@@ -188,6 +188,32 @@ DateTime? _parseCreatedAtUtc(dynamic raw) {
 }
 
 /// REST yanitindaki satirin `name` alani istenen depo ile eslesiyor mu (trim; ASCII icin buyuk/kucuk harf yok sayilir).
+const List<String> kDefaultTankOrder = <String>[
+  'YICME',
+  'GEBAN',
+  'TTOKI',
+  'YTOKI',
+  'AICME',
+];
+
+/// Gecerli depo adlarindan olusan tam liste; aksi halde null.
+List<String>? normalizeTankOrderList(List<String>? saved) {
+  if (saved == null || saved.isEmpty) {
+    return null;
+  }
+  final Set<String> allowed = kDefaultTankOrder.toSet();
+  final List<String> filtered = saved.where(allowed.contains).toList();
+  for (final String tank in kDefaultTankOrder) {
+    if (!filtered.contains(tank)) {
+      filtered.add(tank);
+    }
+  }
+  if (filtered.length != kDefaultTankOrder.length) {
+    return null;
+  }
+  return filtered;
+}
+
 bool _sensorRowMatchesTank(Map<String, dynamic> row, String tankName) {
   final Object? raw = row['name'];
   if (raw == null) {
@@ -231,22 +257,9 @@ class DashboardPage extends StatefulWidget {
 }
 
 class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserver {
-  static const List<String> _defaultTankOrder = <String>[
-    'YICME',
-    'GEBAN',
-    'TTOKI',
-    'YTOKI',
-    'AICME',
-  ];
   static const String _tankOrderStorageKey = 'tank_order_v1';
 
-  final List<String> _tankOrder = <String>[
-    'YICME',
-    'GEBAN',
-    'TTOKI',
-    'YTOKI',
-    'AICME',
-  ];
+  final List<String> _tankOrder = List<String>.from(kDefaultTankOrder);
 
   final SupabaseSensorClient _client = const SupabaseSensorClient(
     endpoint:
@@ -259,6 +272,7 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   final Set<String> _lowAlertSent = <String>{};
   bool _isLoading = true;
   bool _isFetching = false;
+  int _loadGeneration = 0;
   String? _draggingTankName;
   String? _errorMessage;
   DateTime? _lastUpdate;
@@ -366,36 +380,51 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   }
 
   Future<void> _loadSavedOrder() async {
-    final SharedPreferences prefs = await SharedPreferences.getInstance();
-    final List<String>? saved = prefs.getStringList(_tankOrderStorageKey);
-    if (saved == null || saved.isEmpty) return;
+    List<String>? order;
 
-    final Set<String> allowed = _defaultTankOrder.toSet();
-    final List<String> filtered = saved.where(allowed.contains).toList();
-    for (final String tank in _defaultTankOrder) {
-      if (!filtered.contains(tank)) {
-        filtered.add(tank);
-      }
+    try {
+      order = await _client.fetchTankOrder();
+    } catch (error) {
+      _debugLogFetchFailure('TankOrder.fetch', error);
     }
-    if (filtered.length != _defaultTankOrder.length) return;
 
-    if (!mounted) return;
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    if (order == null) {
+      order = normalizeTankOrderList(prefs.getStringList(_tankOrderStorageKey));
+    } else {
+      await prefs.setStringList(_tankOrderStorageKey, order);
+    }
+
+    if (order == null) {
+      return;
+    }
+
+    if (!mounted) {
+      return;
+    }
     setState(() {
       _tankOrder
         ..clear()
-        ..addAll(filtered);
+        ..addAll(order!);
     });
   }
 
   Future<void> _saveOrder() async {
     final SharedPreferences prefs = await SharedPreferences.getInstance();
     await prefs.setStringList(_tankOrderStorageKey, _tankOrder);
+    try {
+      await _client.saveTankOrder(_tankOrder);
+    } catch (error) {
+      _debugLogFetchFailure('TankOrder.save', error);
+    }
   }
 
   Future<void> _loadData({bool showLoader = true}) async {
     if (_isFetching) {
       return;
     }
+    final int generation = ++_loadGeneration;
+    final List<String> tanksSnapshot = List<String>.from(_tankOrder);
     final Map<String, int> previousLevelsSnapshot = Map<String, int>.from(_previousLevels);
     if (showLoader) {
       setState(() {
@@ -409,15 +438,16 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
 
     try {
       final Map<String, TankReading> data = await _client.fetchLatestByTank(
-        _tankOrder,
+        tanksSnapshot,
       );
-      if (!mounted) return;
+      if (!mounted || generation != _loadGeneration) {
+        return;
+      }
       setState(() {
         _latestReadings = data;
         _lastUpdate = DateTime.now();
         _errorMessage = null;
         _isLoading = false;
-        _isFetching = false;
       });
       await _maybeNotifyLowTanks(data, previousLevelsSnapshot);
       for (final MapEntry<String, TankReading> e in data.entries) {
@@ -430,12 +460,19 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
       }
     } catch (error) {
       _debugLogFetchFailure('Dashboard.fetch', error);
-      if (!mounted) return;
+      if (!mounted || generation != _loadGeneration) {
+        return;
+      }
       setState(() {
         _errorMessage = _formatSensorFetchError(error);
         _isLoading = false;
-        _isFetching = false;
       });
+    } finally {
+      if (mounted && generation == _loadGeneration) {
+        setState(() {
+          _isFetching = false;
+        });
+      }
     }
   }
 
@@ -537,9 +574,10 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
                         onDoubleTap: () {
                           Navigator.of(context).push<void>(
                             MaterialPageRoute<void>(
-                              builder: (BuildContext ctx) => TankWeeklyChartPage(
+                              builder: (BuildContext ctx) => TankHistoryChartPage(
                                 tankName: name,
                                 client: _client,
+                                currentLevel: reading?.value,
                               ),
                             ),
                           );
@@ -888,7 +926,6 @@ class _TankCard extends StatelessWidget {
                       blurRadius: 22,
                       offset: const Offset(0, 10),
                     ),
-                    // Alt kenarda hafif derinlik (ince golge cizgisi)
                     BoxShadow(
                       color: Colors.black.withValues(alpha: 0.065),
                       blurRadius: 8,
@@ -980,11 +1017,16 @@ class _TankCard extends StatelessWidget {
                         ),
                       ),
                       SizedBox(width: 8 * ls),
-                      _BracketStatusBadge(
-                        label: badgeLabel,
-                        accent: vivid,
-                        compact: compact,
-                        scaler: scaler,
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: <Widget>[
+                          _BracketStatusBadge(
+                            label: badgeLabel,
+                            accent: vivid,
+                            compact: compact,
+                            scaler: scaler,
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -1319,40 +1361,400 @@ class TankReading {
   final DateTime createdAt;
 }
 
-class TankDailyPoint {
-  const TankDailyPoint({
-    required this.day,
-    required this.value,
-    required this.lastSeenAt,
+/// Kisa surede belirgin dusus: depo anormal hizda bosalmis olabilir.
+class RapidDrainAnomaly {
+  const RapidDrainAnomaly({
+    required this.startAt,
+    required this.endAt,
+    required this.fromLevel,
+    required this.toLevel,
   });
 
-  final DateTime day;
-  final int? value;
-  final DateTime lastSeenAt;
+  final DateTime startAt;
+  final DateTime endAt;
+  final int fromLevel;
+  final int toLevel;
+
+  int get dropPoints => fromLevel - toLevel;
+  Duration get duration => endAt.difference(startAt);
 }
 
-class TankWeeklyChartPage extends StatefulWidget {
-  const TankWeeklyChartPage({
+bool _isRapidDrainEpisode(int fromLevel, int toLevel, Duration span) {
+  if (toLevel >= fromLevel) {
+    return false;
+  }
+  final int drop = fromLevel - toLevel;
+  if (span <= const Duration(hours: 12)) {
+    if (drop >= 67) {
+      return true;
+    }
+    if (fromLevel >= 66 && toLevel <= 33 && drop >= 33) {
+      return true;
+    }
+  }
+  if (span <= const Duration(hours: 6) &&
+      toLevel == 0 &&
+      fromLevel >= 34 &&
+      drop >= 34) {
+    return true;
+  }
+  return false;
+}
+
+List<RapidDrainAnomaly> _mergeRapidDrains(List<RapidDrainAnomaly> items) {
+  if (items.isEmpty) {
+    return items;
+  }
+  final List<RapidDrainAnomaly> sorted = List<RapidDrainAnomaly>.from(items)
+    ..sort((RapidDrainAnomaly a, RapidDrainAnomaly b) =>
+        a.startAt.compareTo(b.startAt));
+
+  final List<RapidDrainAnomaly> merged = <RapidDrainAnomaly>[sorted.first];
+  for (int i = 1; i < sorted.length; i++) {
+    final RapidDrainAnomaly cur = sorted[i];
+    final RapidDrainAnomaly prev = merged.last;
+    final bool overlaps = !cur.startAt.isAfter(prev.endAt.add(const Duration(hours: 1)));
+    if (overlaps) {
+      final int from = prev.fromLevel > cur.fromLevel ? prev.fromLevel : cur.fromLevel;
+      final int to = prev.toLevel < cur.toLevel ? prev.toLevel : cur.toLevel;
+      merged[merged.length - 1] = RapidDrainAnomaly(
+        startAt: prev.startAt.isBefore(cur.startAt) ? prev.startAt : cur.startAt,
+        endAt: prev.endAt.isAfter(cur.endAt) ? prev.endAt : cur.endAt,
+        fromLevel: from,
+        toLevel: to,
+      );
+    } else {
+      merged.add(cur);
+    }
+  }
+  return merged;
+}
+
+/// Olay listesinde (asc veya desc) son 7 gun icindeki hizli bosalmalari bulur.
+List<RapidDrainAnomaly> detectRapidDrains(
+  List<TankEventPoint> events, {
+  Duration window = const Duration(days: 7),
+  Duration maxSpan = const Duration(hours: 12),
+}) {
+  final DateTime windowStart = DateTime.now().subtract(window);
+  final List<TankEventPoint> numeric = events
+      .where((TankEventPoint e) =>
+          e.value != null && !e.at.isBefore(windowStart))
+      .toList()
+    ..sort((TankEventPoint a, TankEventPoint b) => a.at.compareTo(b.at));
+
+  final List<RapidDrainAnomaly> found = <RapidDrainAnomaly>[];
+  for (int i = 0; i < numeric.length; i++) {
+    for (int j = i + 1; j < numeric.length; j++) {
+      final Duration span = numeric[j].at.difference(numeric[i].at);
+      if (span > maxSpan) {
+        break;
+      }
+      final int from = numeric[i].value!;
+      final int to = numeric[j].value!;
+      if (_isRapidDrainEpisode(from, to, span)) {
+        found.add(
+          RapidDrainAnomaly(
+            startAt: numeric[i].at,
+            endAt: numeric[j].at,
+            fromLevel: from,
+            toLevel: to,
+          ),
+        );
+      }
+    }
+  }
+  return _mergeRapidDrains(found);
+}
+
+/// Anomali listesi: en yeni olay ustte (bitis zamanina gore).
+List<RapidDrainAnomaly> _sortAnomaliesNewestFirst(List<RapidDrainAnomaly> items) {
+  final List<RapidDrainAnomaly> sorted = List<RapidDrainAnomaly>.from(items);
+  sorted.sort((RapidDrainAnomaly a, RapidDrainAnomaly b) {
+    final int byEnd = b.endAt.compareTo(a.endAt);
+    if (byEnd != 0) {
+      return byEnd;
+    }
+    return b.startAt.compareTo(a.startAt);
+  });
+  return sorted;
+}
+
+String _formatShortDuration(Duration d) {
+  if (d.inMinutes < 1) {
+    return '1 dk alti';
+  }
+  if (d.inHours < 1) {
+    return '${d.inMinutes} dk';
+  }
+  final int h = d.inHours;
+  final int m = d.inMinutes.remainder(60);
+  if (m == 0) {
+    return '$h sa';
+  }
+  return '$h sa $m dk';
+}
+
+/// Hizli bosalma banner'i: her zaman gun/ay + saat (grafik ekseni kisaltmasi kullanilmaz).
+String _formatAnomalyDateTime(DateTime d) {
+  final String dd = d.day.toString().padLeft(2, '0');
+  final String mm = d.month.toString().padLeft(2, '0');
+  final String hh = d.hour.toString().padLeft(2, '0');
+  final String mi = d.minute.toString().padLeft(2, '0');
+  if (d.year != DateTime.now().year) {
+    final String yy = (d.year % 100).toString().padLeft(2, '0');
+    return '$dd/$mm/$yy $hh:$mi';
+  }
+  return '$dd/$mm $hh:$mi';
+}
+
+String _formatAnomalyRange(RapidDrainAnomaly a) {
+  final String s = _formatAnomalyDateTime(a.startAt);
+  final String e = _formatAnomalyDateTime(a.endAt);
+  return '$s – $e';
+}
+
+String _describeRapidDrainAnomaly(RapidDrainAnomaly a) {
+  return '%${a.fromLevel} → %${a.toLevel}, '
+      '${_formatShortDuration(a.duration)} icinde';
+}
+
+class TankEventPoint {
+  const TankEventPoint({
+    required this.at,
+    required this.value,
+  });
+
+  final DateTime at;
+  final int? value;
+}
+
+class TankEventsResult {
+  const TankEventsResult({
+    required this.inWindow,
+    this.lastNumericBeforeWindow,
+  });
+
+  final List<TankEventPoint> inWindow;
+  final TankEventPoint? lastNumericBeforeWindow;
+}
+
+List<LineChartBarData> _buildStepLineBars({
+  required List<TankEventPoint> events,
+  required DateTime windowEnd,
+  required Color lineColor,
+}) {
+  final double endX = windowEnd.millisecondsSinceEpoch.toDouble();
+  final List<List<FlSpot>> segmentSpots = <List<FlSpot>>[];
+  List<FlSpot> current = <FlSpot>[];
+
+  for (final TankEventPoint e in events) {
+    final double x = e.at.millisecondsSinceEpoch.toDouble();
+    if (e.value == null) {
+      if (current.isNotEmpty) {
+        segmentSpots.add(List<FlSpot>.from(current));
+        current = <FlSpot>[];
+      }
+      continue;
+    }
+    current.add(FlSpot(x, e.value!.toDouble()));
+  }
+
+  if (current.isNotEmpty) {
+    final FlSpot last = current.last;
+    if (endX > last.x) {
+      current.add(FlSpot(endX, last.y));
+    }
+    segmentSpots.add(current);
+  }
+
+  return segmentSpots
+      .map(
+        (List<FlSpot> spots) => LineChartBarData(
+          spots: spots,
+          isStepLineChart: true,
+          color: lineColor,
+          barWidth: 3,
+          dotData: FlDotData(
+            show: true,
+            getDotPainter: (
+              FlSpot spot,
+              double x,
+              LineChartBarData bar,
+              int index,
+            ) {
+              return FlDotCirclePainter(
+                radius: 4,
+                color: lineColor,
+                strokeWidth: 2,
+                strokeColor: Colors.white,
+              );
+            },
+          ),
+          belowBarData: BarAreaData(
+            show: true,
+            gradient: LinearGradient(
+              colors: <Color>[
+                lineColor.withValues(alpha: 0.22),
+                lineColor.withValues(alpha: 0.02),
+              ],
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+            ),
+          ),
+        ),
+      )
+      .toList();
+}
+
+String _formatChartAxisTime(DateTime d) {
+  final String dd = d.day.toString().padLeft(2, '0');
+  final String mm = d.month.toString().padLeft(2, '0');
+  if (DateTime.now().difference(d).inDays < 2) {
+    final String hh = d.hour.toString().padLeft(2, '0');
+    final String mi = d.minute.toString().padLeft(2, '0');
+    return '$dd/$mm $hh:$mi';
+  }
+  return '$dd/$mm';
+}
+
+bool _isChartWeekend(DateTime d) {
+  return d.weekday == DateTime.saturday || d.weekday == DateTime.sunday;
+}
+
+/// Hafta sonu bant rengi (kritik seviye sarisindan ayirt edilir).
+const Color _chartWeekendFillTop = Color(0xFFFFF176);
+const Color _chartWeekendFillBottom = Color(0xFFFFEA00);
+const Color _chartWeekendLabelBg = Color(0xFFFFEB3B);
+const Color _chartWeekendLabelText = Color(0xFF6D4C00);
+
+/// Grafik penceresindeki cumartesi / pazar gunlerini arka planda renklendirir.
+List<VerticalRangeAnnotation> _buildWeekendRangeAnnotations({
+  required DateTime windowStart,
+  required DateTime windowEnd,
+}) {
+  final double minX = windowStart.millisecondsSinceEpoch.toDouble();
+  final double maxX = windowEnd.millisecondsSinceEpoch.toDouble();
+  final List<VerticalRangeAnnotation> bands = <VerticalRangeAnnotation>[];
+
+  DateTime day = DateTime(windowStart.year, windowStart.month, windowStart.day);
+  final DateTime lastDay = DateTime(windowEnd.year, windowEnd.month, windowEnd.day);
+
+  while (!day.isAfter(lastDay)) {
+    if (_isChartWeekend(day)) {
+      final DateTime dayEnd = day.add(const Duration(days: 1));
+      final double x1 = day.millisecondsSinceEpoch.toDouble();
+      final double x2 = dayEnd.millisecondsSinceEpoch.toDouble();
+      final double clippedX1 = x1 < minX ? minX : x1;
+      final double clippedX2 = x2 > maxX ? maxX : x2;
+      if (clippedX2 > clippedX1) {
+        bands.add(
+          VerticalRangeAnnotation(
+            x1: clippedX1,
+            x2: clippedX2,
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: <Color>[
+                _chartWeekendFillTop.withValues(alpha: 0.58),
+                _chartWeekendFillBottom.withValues(alpha: 0.50),
+              ],
+            ),
+          ),
+        );
+      }
+    }
+    day = day.add(const Duration(days: 1));
+  }
+  return bands;
+}
+
+Widget _buildChartWeekendLegend() {
+  return Padding(
+    padding: const EdgeInsets.only(top: 6, left: 4, right: 4),
+    child: Row(
+      children: <Widget>[
+        Container(
+          width: 14,
+          height: 14,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(3),
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: <Color>[
+                _chartWeekendFillTop.withValues(alpha: 0.85),
+                _chartWeekendFillBottom.withValues(alpha: 0.75),
+              ],
+            ),
+            border: Border.all(color: _chartWeekendLabelText.withValues(alpha: 0.35)),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Text(
+          'Hafta sonu (Cmt–Paz)',
+          style: TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+            color: _chartWeekendLabelText,
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class TankHistoryChartPage extends StatefulWidget {
+  const TankHistoryChartPage({
     super.key,
     required this.tankName,
     required this.client,
+    this.currentLevel,
   });
 
   final String tankName;
   final SupabaseSensorClient client;
+  final int? currentLevel;
 
   @override
-  State<TankWeeklyChartPage> createState() => _TankWeeklyChartPageState();
+  State<TankHistoryChartPage> createState() => _TankHistoryChartPageState();
 }
 
-class _TankWeeklyChartPageState extends State<TankWeeklyChartPage> {
+class _TankHistoryChartPageState extends State<TankHistoryChartPage> {
+  static const List<int> _chartWindowDayOptions = <int>[7, 15, 30];
+
+  int _chartWindowDays = 7;
   bool _loading = true;
   String? _error;
-  List<TankDailyPoint> _points = <TankDailyPoint>[];
+  TankEventsResult? _result;
+
+  Duration get _window => Duration(days: _chartWindowDays);
+
+  int get _eventFetchLimit {
+    if (_chartWindowDays <= 7) {
+      return 500;
+    }
+    if (_chartWindowDays <= 15) {
+      return 800;
+    }
+    return 1200;
+  }
+
+  String get _windowLabel => 'Son $_chartWindowDays gun';
 
   @override
   void initState() {
     super.initState();
+    _load();
+  }
+
+  void _onChartWindowDaysChanged(int? days) {
+    if (days == null || days == _chartWindowDays) {
+      return;
+    }
+    setState(() {
+      _chartWindowDays = days;
+    });
     _load();
   }
 
@@ -1362,15 +1764,18 @@ class _TankWeeklyChartPageState extends State<TankWeeklyChartPage> {
       _error = null;
     });
     try {
-      final List<TankDailyPoint> data =
-          await widget.client.fetchLast7DaysDailyLatest(widget.tankName);
+      final TankEventsResult data = await widget.client.fetchEvents(
+        widget.tankName,
+        window: _window,
+        limit: _eventFetchLimit,
+      );
       if (!mounted) return;
       setState(() {
-        _points = data;
+        _result = data;
         _loading = false;
       });
     } catch (e) {
-      _debugLogFetchFailure('Chart7d.${widget.tankName}', e);
+      _debugLogFetchFailure('ChartEvents.${widget.tankName}', e);
       if (!mounted) return;
       setState(() {
         _error = _formatSensorFetchError(e);
@@ -1379,225 +1784,488 @@ class _TankWeeklyChartPageState extends State<TankWeeklyChartPage> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFFF6F8FB),
-      appBar: AppBar(
-        title: Text('${widget.tankName} — Son 7 gun'),
-      ),
-      body: RefreshIndicator(
-        color: const Color(0xFF0288D1),
-        onRefresh: _load,
-        child: SingleChildScrollView(
-          physics: const AlwaysScrollableScrollPhysics(),
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              minHeight: MediaQuery.sizeOf(context).height -
-                  kToolbarHeight -
-                  MediaQuery.paddingOf(context).top,
+  int? _lastNumericInWindow(List<TankEventPoint> events) {
+    for (int i = events.length - 1; i >= 0; i--) {
+      if (events[i].value != null) {
+        return events[i].value;
+      }
+    }
+    return null;
+  }
+
+  DateTime? _lastChangeAt(List<TankEventPoint> events) {
+    for (int i = events.length - 1; i >= 0; i--) {
+      if (events[i].value != null) {
+        return events[i].at;
+      }
+    }
+    return null;
+  }
+
+  int _staleCount(List<TankEventPoint> events) {
+    return events.where((TankEventPoint e) => e.value == null).length;
+  }
+
+  Widget _buildPeriodSelector() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
+      child: Material(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: const Color(0xFF0288D1).withValues(alpha: 0.35)),
+          ),
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<int>(
+              value: _chartWindowDays,
+              isExpanded: true,
+              borderRadius: BorderRadius.circular(12),
+              icon: const Icon(Icons.expand_more_rounded),
+              hint: const Text('Donem secin'),
+              items: _chartWindowDayOptions
+                  .map(
+                    (int days) => DropdownMenuItem<int>(
+                      value: days,
+                      child: Text(
+                        'Son $days gun',
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  )
+                  .toList(),
+              onChanged: _onChartWindowDaysChanged,
             ),
-            child: _loading
-                ? const Center(child: CircularProgressIndicator())
-                : _error != null
-                    ? Center(
-                        child: Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: Material(
-                            color: Colors.red.shade50,
-                            borderRadius: BorderRadius.circular(12),
-                            child: Padding(
-                              padding: const EdgeInsets.all(16),
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: <Widget>[
-                                  Icon(
-                                    Icons.cloud_off_rounded,
-                                    color: Colors.red.shade800,
-                                    size: 40,
-                                  ),
-                                  const SizedBox(height: 12),
-                                  Text(
-                                    _error!,
-                                    textAlign: TextAlign.center,
-                                    style: TextStyle(
-                                      color: Colors.red.shade900,
-                                      height: 1.4,
-                                      fontSize: 14,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ),
-                      )
-                    : _buildChart(),
           ),
         ),
       ),
     );
   }
 
-  Widget _buildChart() {
-    final List<FlSpot> spots = <FlSpot>[];
-    for (int i = 0; i < _points.length; i++) {
-      final int? v = _points[i].value;
-      if (v != null) {
-        spots.add(FlSpot(i.toDouble(), v.toDouble()));
-      }
-    }
-    if (spots.length < 2) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Text(
-            'Grafik icin en az iki gunluk sayisal kayit gerekli '
-            '(bazi gunlerde son kayit "veri yok" / null ise o gun cizilmez).',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodyLarge,
-          ),
-        ),
-      );
-    }
+  @override
+  Widget build(BuildContext context) {
+    final int? headerLevel =
+        widget.currentLevel ?? _lastNumericInWindow(_result?.inWindow ?? <TankEventPoint>[]);
+    final double bodyMinHeight = MediaQuery.sizeOf(context).height -
+        kToolbarHeight -
+        MediaQuery.paddingOf(context).top -
+        64;
 
-    int? lastNumeric;
-    for (int i = _points.length - 1; i >= 0; i--) {
-      if (_points[i].value != null) {
-        lastNumeric = _points[i].value;
-        break;
-      }
-    }
-    final Color lineColor = _colorForNullableLevel(lastNumeric);
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+    return Scaffold(
+      backgroundColor: const Color(0xFFF6F8FB),
+      appBar: AppBar(
+        title: Text('${widget.tankName} · $_windowLabel'),
+      ),
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          Text(
-            'Her gun icin o gunun en son kaydi kullanilir.',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const SizedBox(height: 16),
+          _buildPeriodSelector(),
           Expanded(
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(18),
-                boxShadow: <BoxShadow>[
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.06),
-                    blurRadius: 12,
-                    offset: const Offset(0, 6),
-                  ),
-                ],
-              ),
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 16, 12, 8),
-                child: LineChart(
-                  LineChartData(
-                    minY: 0,
-                    maxY: 100,
-                    gridData: FlGridData(
-                      show: true,
-                      drawVerticalLine: false,
-                      horizontalInterval: 25,
-                      getDrawingHorizontalLine: (double value) {
-                        return FlLine(
-                          color: Colors.grey.shade200,
-                          strokeWidth: 1,
-                        );
-                      },
-                    ),
-                    titlesData: FlTitlesData(
-                      topTitles: const AxisTitles(
-                        sideTitles: SideTitles(showTitles: false),
-                      ),
-                      rightTitles: const AxisTitles(
-                        sideTitles: SideTitles(showTitles: false),
-                      ),
-                      leftTitles: AxisTitles(
-                        sideTitles: SideTitles(
-                          showTitles: true,
-                          reservedSize: 36,
-                          interval: 25,
-                          getTitlesWidget: (double value, TitleMeta meta) {
-                            return Text(
-                              '${value.toInt()}',
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: Colors.grey.shade700,
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                      bottomTitles: AxisTitles(
-                        sideTitles: SideTitles(
-                          showTitles: true,
-                          reservedSize: 28,
-                          interval: 1,
-                          getTitlesWidget: (double value, TitleMeta meta) {
-                            final int i = value.round();
-                            if (i < 0 || i >= _points.length) {
-                              return const SizedBox.shrink();
-                            }
-                            final DateTime d = _points[i].day;
-                            final String dd = d.day.toString().padLeft(2, '0');
-                            final String mm = d.month.toString().padLeft(2, '0');
-                            return Padding(
-                              padding: const EdgeInsets.only(top: 8),
-                              child: Text(
-                                '$dd/$mm',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: Colors.grey.shade800,
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                    ),
-                    borderData: FlBorderData(show: false),
-                    lineBarsData: <LineChartBarData>[
-                      LineChartBarData(
-                        spots: spots,
-                        isCurved: true,
-                        color: lineColor,
-                        barWidth: 3,
-                        dotData: FlDotData(
-                          show: true,
-                          getDotPainter: (FlSpot spot, double x, LineChartBarData bar, int index) {
-                            return FlDotCirclePainter(
-                              radius: 4,
-                              color: lineColor,
-                              strokeWidth: 2,
-                              strokeColor: Colors.white,
-                            );
-                          },
-                        ),
-                        belowBarData: BarAreaData(
-                          show: true,
-                          gradient: LinearGradient(
-                            colors: <Color>[
-                              lineColor.withValues(alpha: 0.22),
-                              lineColor.withValues(alpha: 0.02),
-                            ],
-                            begin: Alignment.topCenter,
-                            end: Alignment.bottomCenter,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  duration: Duration.zero,
+            child: RefreshIndicator(
+              color: const Color(0xFF0288D1),
+              onRefresh: _load,
+              child: SingleChildScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(minHeight: bodyMinHeight),
+                  child: _loading
+                      ? const Center(child: CircularProgressIndicator())
+                      : _error != null
+                          ? _buildError()
+                          : _buildContent(headerLevel),
                 ),
               ),
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildError() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Material(
+          color: Colors.red.shade50,
+          borderRadius: BorderRadius.circular(12),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Icon(
+                  Icons.cloud_off_rounded,
+                  color: Colors.red.shade800,
+                  size: 40,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  _error!,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.red.shade900,
+                    height: 1.4,
+                    fontSize: 14,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildContent(int? headerLevel) {
+    final TankEventsResult result = _result!;
+    final List<TankEventPoint> events = result.inWindow;
+    final int numericCount =
+        events.where((TankEventPoint e) => e.value != null).length;
+    final int staleCount = _staleCount(events);
+    final DateTime? lastChange = _lastChangeAt(events);
+    final DateTime windowEnd = DateTime.now();
+    final DateTime windowStart = windowEnd.subtract(_window);
+
+    final String summary = () {
+      if (numericCount == 0 && result.lastNumericBeforeWindow == null) {
+        return 'Bu depo icin henuz gecmis kayit yok.';
+      }
+      final StringBuffer buf = StringBuffer();
+      if (numericCount == 0) {
+        buf.write('$_windowLabel icinde seviye degisimi yok.');
+      } else {
+        buf.write('$numericCount degisim');
+        if (lastChange != null) {
+          buf.write(' · son: ${_formatRelativeSensorAge(lastChange)}');
+        }
+      }
+      if (staleCount > 0) {
+        buf.write(' · $staleCount baglanti uyarisi');
+      }
+      return buf.toString();
+    }();
+
+    final List<RapidDrainAnomaly> anomalies = _sortAnomaliesNewestFirst(
+      detectRapidDrains(events, window: _window),
+    );
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          if (headerLevel != null) ...<Widget>[
+            Text(
+              'Guncel: %$headerLevel',
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+            ),
+            const SizedBox(height: 10),
+          ],
+          _buildChartBody(
+            events: events,
+            result: result,
+            windowStart: windowStart,
+            windowEnd: windowEnd,
+            numericCount: numericCount,
+            anomalies: anomalies,
+          ),
+          const SizedBox(height: 12),
+          Text(
+            summary,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Kayitlar yalnizca seviye degistiginde veya baglanti uyarisi '
+            '(veri yok) oldugunda olusur.',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Colors.grey.shade700,
+                  height: 1.35,
+                ),
+          ),
+          if (anomalies.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 20),
+            Text(
+              'Hizli bosalma olaylari',
+              style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+            ),
+            const SizedBox(height: 8),
+            ...anomalies.map(_buildAnomalyBanner),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAnomalyBanner(RapidDrainAnomaly anomaly) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Material(
+        color: const Color(0xFFFFF3E0),
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: const Color(0xFFE65100).withValues(alpha: 0.45)),
+          ),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              const Icon(
+                Icons.trending_down_rounded,
+                color: Color(0xFFE65100),
+                size: 22,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    const Text(
+                      'Hizli bosalma (anomali)',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w800,
+                        color: Color(0xFFBF360C),
+                        fontSize: 13.5,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '${_formatAnomalyRange(anomaly)}\n'
+                      '${_describeRapidDrainAnomaly(anomaly)}',
+                      style: TextStyle(
+                        color: Colors.orange.shade900,
+                        height: 1.35,
+                        fontSize: 12.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildChartBody({
+    required List<TankEventPoint> events,
+    required TankEventsResult result,
+    required DateTime windowStart,
+    required DateTime windowEnd,
+    required int numericCount,
+    required List<RapidDrainAnomaly> anomalies,
+  }) {
+    if (numericCount == 0) {
+      final TankEventPoint? prior = result.lastNumericBeforeWindow;
+      return _buildInfoCard(
+        icon: Icons.timeline_rounded,
+        message: prior == null
+            ? 'Bu depo icin henuz gecmis kayit yok.'
+            : '$_windowLabel icinde seviye degisimi yok.\n'
+                'Son bilinen: %${prior.value} '
+                '(${_formatRelativeSensorAge(prior.at)}).',
+      );
+    }
+
+    final int? lastLevel = _lastNumericInWindow(events);
+    final Color lineColor = _colorForNullableLevel(lastLevel);
+    final List<LineChartBarData> bars = _buildStepLineBars(
+      events: events,
+      windowEnd: windowEnd,
+      lineColor: lineColor,
+    );
+
+    if (bars.isEmpty) {
+      return _buildInfoCard(
+        icon: Icons.timeline_rounded,
+        message: 'Grafik icin sayisal kayit bulunamadi.',
+      );
+    }
+
+    final double minX = windowStart.millisecondsSinceEpoch.toDouble();
+    final double maxX = windowEnd.millisecondsSinceEpoch.toDouble();
+    final double xInterval = ((maxX - minX) / 4).clamp(1.0, double.infinity);
+
+    final List<VerticalRangeAnnotation> drainHighlights = anomalies
+        .map(
+          (RapidDrainAnomaly a) => VerticalRangeAnnotation(
+            x1: a.startAt.millisecondsSinceEpoch.toDouble(),
+            x2: a.endAt.millisecondsSinceEpoch.toDouble(),
+            color: const Color(0xFFE65100).withValues(alpha: 0.14),
+          ),
+        )
+        .toList();
+
+    final List<VerticalRangeAnnotation> weekendBands = _buildWeekendRangeAnnotations(
+      windowStart: windowStart,
+      windowEnd: windowEnd,
+    );
+
+    return SizedBox(
+      height: 328,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(18),
+          boxShadow: <BoxShadow>[
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.06),
+              blurRadius: 12,
+              offset: const Offset(0, 6),
+            ),
+          ],
+        ),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(8, 16, 12, 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Expanded(
+                child: LineChart(
+                  LineChartData(
+              minX: minX,
+              maxX: maxX,
+              minY: 0,
+              maxY: 100,
+              gridData: FlGridData(
+                show: true,
+                drawVerticalLine: false,
+                horizontalInterval: 25,
+                getDrawingHorizontalLine: (double value) {
+                  return FlLine(
+                    color: Colors.grey.shade200,
+                    strokeWidth: 1,
+                  );
+                },
+              ),
+              titlesData: FlTitlesData(
+                topTitles: const AxisTitles(
+                  sideTitles: SideTitles(showTitles: false),
+                ),
+                rightTitles: const AxisTitles(
+                  sideTitles: SideTitles(showTitles: false),
+                ),
+                leftTitles: AxisTitles(
+                  sideTitles: SideTitles(
+                    showTitles: true,
+                    reservedSize: 36,
+                    interval: 25,
+                    getTitlesWidget: (double value, TitleMeta meta) {
+                      return Text(
+                        '${value.toInt()}',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.grey.shade700,
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                bottomTitles: AxisTitles(
+                  sideTitles: SideTitles(
+                    showTitles: true,
+                    reservedSize: 32,
+                    interval: xInterval,
+                    getTitlesWidget: (double value, TitleMeta meta) {
+                      if (value < minX || value > maxX) {
+                        return const SizedBox.shrink();
+                      }
+                      final DateTime d =
+                          DateTime.fromMillisecondsSinceEpoch(value.toInt());
+                      final bool weekend = _isChartWeekend(d);
+                      final String label = _formatChartAxisTime(d);
+                      if (weekend) {
+                        return Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 5,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: _chartWeekendLabelBg.withValues(alpha: 0.82),
+                              borderRadius: BorderRadius.circular(4),
+                              border: Border.all(
+                                color: _chartWeekendLabelText.withValues(alpha: 0.28),
+                              ),
+                            ),
+                            child: Text(
+                              label,
+                              style: const TextStyle(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w800,
+                                color: _chartWeekendLabelText,
+                              ),
+                            ),
+                          ),
+                        );
+                      }
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          label,
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w500,
+                            color: Colors.grey.shade800,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+              borderData: FlBorderData(show: false),
+              lineBarsData: bars,
+              rangeAnnotations: RangeAnnotations(
+                verticalRangeAnnotations: <VerticalRangeAnnotation>[
+                  ...weekendBands,
+                  ...drainHighlights,
+                ],
+              ),
+            ),
+            duration: Duration.zero,
+                ),
+              ),
+              _buildChartWeekendLegend(),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInfoCard({required IconData icon, required String message}) {
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(18),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Icon(icon, color: Colors.blueGrey.shade600, size: 28),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                message,
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      height: 1.4,
+                    ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1613,6 +2281,23 @@ class SupabaseSensorClient {
   final String endpoint;
   final String apiKey;
   final Duration requestTimeout;
+
+  static const String _dashboardPreferencesId = 'default';
+
+  Uri _dashboardPreferencesUri({Map<String, String>? queryParameters}) {
+    final Uri base = Uri.parse(endpoint);
+    return Uri(
+      scheme: base.scheme,
+      host: base.host,
+      path: '/rest/v1/dashboard_preferences',
+    ).replace(queryParameters: queryParameters);
+  }
+
+  Map<String, String> get _jsonHeaders => <String, String>{
+        'apikey': apiKey,
+        'Authorization': 'Bearer $apiKey',
+        'Content-Type': 'application/json',
+      };
 
   Future<http.Response> _getWithTimeout(Uri uri) async {
     try {
@@ -1636,34 +2321,18 @@ class SupabaseSensorClient {
   Future<Map<String, TankReading>> fetchLatestByTank(
     List<String> tankNames,
   ) async {
-    final List<TankReading?> rows = await Future.wait(
-      tankNames.map(_fetchLatestSingleForTank),
-    );
-
-    final Map<String, TankReading> latest = <String, TankReading>{};
-    for (int i = 0; i < tankNames.length; i++) {
-      final TankReading? r = rows[i];
-      if (r != null) {
-        latest[tankNames[i]] = TankReading(
-          name: tankNames[i],
-          value: r.value,
-          createdAt: r.createdAt,
-        );
-      }
+    final List<String> names = List<String>.from(tankNames);
+    if (names.isEmpty) {
+      return <String, TankReading>{};
     }
-    return latest;
-  }
 
-  /// En yeni satir `value=null` (stale) olsa bile, son sayisal doluluk varsa onu gosterir.
-  /// Tek HTTP: son N satir taranir (PostgREST `not.is.null` tip uyumsuzlugundan kacinmak icin).
-  Future<TankReading?> _fetchLatestSingleForTank(String tankName) async {
     final Uri base = Uri.parse(endpoint);
     final Uri uri = base.replace(
       queryParameters: <String, String>{
         'select': 'name,value,created_at',
-        'name': 'eq.$tankName',
+        'name': 'in.(${names.join(',')})',
         'order': 'created_at.desc',
-        'limit': '40',
+        'limit': '${names.length * 40}',
       },
     );
 
@@ -1672,7 +2341,7 @@ class SupabaseSensorClient {
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (kDebugMode) {
         debugPrint(
-          'Supabase ($tankName) HTTP ${response.statusCode} ${response.body}',
+          'Supabase (batch) HTTP ${response.statusCode} ${response.body}',
         );
       }
       throw Exception('HTTP ${response.statusCode}');
@@ -1680,37 +2349,46 @@ class SupabaseSensorClient {
 
     final dynamic decoded = jsonDecode(response.body);
     if (decoded is! List<dynamic>) {
-      throw Exception('Beklenmeyen yanit formati ($tankName)');
+      throw Exception('Beklenmeyen yanit formati (batch)');
     }
-    if (decoded.isEmpty) {
-      return null;
-    }
-    final List<Map<String, dynamic>> matching = <Map<String, dynamic>>[];
+
+    final Map<String, List<Map<String, dynamic>>> rowsByTank =
+        <String, List<Map<String, dynamic>>>{};
     for (final dynamic row in decoded) {
       if (row is! Map) {
         continue;
       }
       final Map<String, dynamic> m = Map<String, dynamic>.from(row);
-      if (_sensorRowMatchesTank(m, tankName)) {
-        matching.add(m);
+      for (final String tankName in names) {
+        if (_sensorRowMatchesTank(m, tankName)) {
+          rowsByTank.putIfAbsent(tankName, () => <Map<String, dynamic>>[]).add(m);
+          break;
+        }
       }
     }
-    if (matching.isEmpty) {
-      if (kDebugMode && decoded.isNotEmpty) {
-        debugPrint(
-          'Supabase ($tankName): gelen ${decoded.length} satirda name="$tankName" '
-          'eslesmedi; bu depo icin veri yok.',
-        );
+
+    final Map<String, TankReading> latest = <String, TankReading>{};
+    for (final String tankName in names) {
+      final List<Map<String, dynamic>> rows = rowsByTank[tankName] ?? const [];
+      if (rows.isEmpty) {
+        continue;
       }
+      final TankReading? reading = _latestReadingFromTankRows(rows, tankName);
+      if (reading != null) {
+        latest[tankName] = reading;
+      }
+    }
+    return latest;
+  }
+
+  TankReading? _latestReadingFromTankRows(
+    List<Map<String, dynamic>> rows,
+    String tankName,
+  ) {
+    if (rows.isEmpty) {
       return null;
     }
-    for (final Map<String, dynamic> m in matching) {
-      final TankReading? r = _tankReadingFromRow(m, displayName: tankName);
-      if (r != null && r.value != null) {
-        return r;
-      }
-    }
-    return _tankReadingFromRow(matching.first, displayName: tankName);
+    return _tankReadingFromRow(rows.first, displayName: tankName);
   }
 
   TankReading? _tankReadingFromRow(dynamic raw, {required String displayName}) {
@@ -1729,15 +2407,19 @@ class SupabaseSensorClient {
     );
   }
 
-  /// Son 7 gun (bugun dahil) icin her gunun en son `value` degerini dondurur.
-  Future<List<TankDailyPoint>> fetchLast7DaysDailyLatest(String tankName) async {
+  /// Son [window] icindeki tum olaylar (asc) + pencereden onceki son sayisal kayit.
+  Future<TankEventsResult> fetchEvents(
+    String tankName, {
+    Duration window = const Duration(days: 7),
+    int limit = 500,
+  }) async {
     final Uri base = Uri.parse(endpoint);
     final Uri uri = base.replace(
       queryParameters: <String, String>{
         'select': 'name,value,created_at',
         'name': 'eq.$tankName',
         'order': 'created_at.desc',
-        'limit': '800',
+        'limit': '$limit',
       },
     );
 
@@ -1746,7 +2428,7 @@ class SupabaseSensorClient {
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (kDebugMode) {
         debugPrint(
-          'Supabase chart HTTP ${response.statusCode} ${response.body}',
+          'Supabase events HTTP ${response.statusCode} ${response.body}',
         );
       }
       throw Exception('HTTP ${response.statusCode}');
@@ -1757,7 +2439,9 @@ class SupabaseSensorClient {
       throw Exception('Beklenmeyen yanit formati');
     }
 
-    final Map<String, TankDailyPoint> bestByDay = <String, TankDailyPoint>{};
+    final DateTime windowStartUtc = DateTime.now().toUtc().subtract(window);
+    final List<TankEventPoint> inWindow = <TankEventPoint>[];
+    TankEventPoint? lastNumericBeforeWindow;
 
     for (final dynamic row in decoded) {
       if (row is! Map) {
@@ -1772,42 +2456,100 @@ class SupabaseSensorClient {
       if (createdAtUtc == null) {
         continue;
       }
+      final DateTime atLocal = createdAtUtc.toLocal();
+      final TankEventPoint point = TankEventPoint(at: atLocal, value: value);
 
-      final DateTime local = createdAtUtc.toLocal();
-      final DateTime day = DateTime(local.year, local.month, local.day);
-      final String dayKey = '${day.year}-${day.month}-${day.day}';
-
-      final TankDailyPoint? existing = bestByDay[dayKey];
-      if (existing == null || local.isAfter(existing.lastSeenAt)) {
-        bestByDay[dayKey] = TankDailyPoint(day: day, value: value, lastSeenAt: local);
-      }
-    }
-
-    final DateTime today = DateTime.now();
-    final DateTime todayDate = DateTime(today.year, today.month, today.day);
-    final List<TankDailyPoint> series = <TankDailyPoint>[];
-    int? carryValue;
-    DateTime? carrySeen;
-
-    for (int i = 6; i >= 0; i--) {
-      final DateTime d = todayDate.subtract(Duration(days: i));
-      final String key = '${d.year}-${d.month}-${d.day}';
-      final TankDailyPoint? p = bestByDay[key];
-      if (p != null) {
-        if (p.value != null) {
-          carryValue = p.value;
-          carrySeen = p.lastSeenAt;
-          series.add(TankDailyPoint(day: d, value: p.value, lastSeenAt: p.lastSeenAt));
-        } else {
-          carryValue = null;
-          series.add(TankDailyPoint(day: d, value: null, lastSeenAt: p.lastSeenAt));
+      if (createdAtUtc.isBefore(windowStartUtc)) {
+        if (value != null && lastNumericBeforeWindow == null) {
+          lastNumericBeforeWindow = point;
         }
-      } else if (carryValue != null && carrySeen != null) {
-        series.add(TankDailyPoint(day: d, value: carryValue, lastSeenAt: carrySeen));
+      } else {
+        inWindow.add(point);
       }
     }
 
-    return series;
+    inWindow.sort((TankEventPoint a, TankEventPoint b) => a.at.compareTo(b.at));
+
+    return TankEventsResult(
+      inWindow: inWindow,
+      lastNumericBeforeWindow: lastNumericBeforeWindow,
+    );
+  }
+
+  /// Supabase `dashboard_preferences` (id=default): surukle-birak depo sirasi.
+  Future<List<String>?> fetchTankOrder() async {
+    final Uri uri = _dashboardPreferencesUri(
+      queryParameters: <String, String>{
+        'select': 'tank_order',
+        'id': 'eq.$_dashboardPreferencesId',
+        'limit': '1',
+      },
+    );
+
+    final http.Response response = await _getWithTimeout(uri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('HTTP ${response.statusCode}');
+    }
+
+    final dynamic decoded = jsonDecode(response.body);
+    if (decoded is! List<dynamic> || decoded.isEmpty) {
+      return null;
+    }
+    final dynamic row = decoded.first;
+    if (row is! Map) {
+      return null;
+    }
+    final dynamic rawOrder = row['tank_order'];
+    if (rawOrder is! List<dynamic>) {
+      return null;
+    }
+    return normalizeTankOrderList(
+      rawOrder.map((dynamic e) => e.toString()).toList(),
+    );
+  }
+
+  Future<void> saveTankOrder(List<String> order) async {
+    final List<String>? normalized = normalizeTankOrderList(order);
+    if (normalized == null) {
+      return;
+    }
+
+    final Uri uri = _dashboardPreferencesUri(
+      queryParameters: <String, String>{
+        'id': 'eq.$_dashboardPreferencesId',
+      },
+    );
+
+    try {
+      final http.Response response = await http
+          .patch(
+            uri,
+            headers: <String, String>{
+              ..._jsonHeaders,
+              'Prefer': 'return=minimal',
+            },
+            body: jsonEncode(<String, dynamic>{
+              'tank_order': normalized,
+              'updated_at': DateTime.now().toUtc().toIso8601String(),
+            }),
+          )
+          .timeout(requestTimeout);
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        return;
+      }
+      if (kDebugMode) {
+        debugPrint(
+          'TankOrder PATCH ${response.statusCode} ${response.body}',
+        );
+      }
+      throw Exception('HTTP ${response.statusCode}');
+    } on TimeoutException {
+      throw TimeoutException(
+        'Supabase istegi zaman asimina ugradi (${requestTimeout.inSeconds}s)',
+        requestTimeout,
+      );
+    }
   }
 }
 
