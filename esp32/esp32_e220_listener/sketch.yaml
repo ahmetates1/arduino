@@ -1,0 +1,14 @@
+profiles:
+  default:
+    fqbn: esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=cdc,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=16M,PartitionScheme=default,DebugLevel=none,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default
+    platforms:
+      - platform: esp32:esp32 (3.3.9)
+    libraries: []
+default_profile: default
+
+# Add your libraries here in the format:
+# libraries:
+#   - LibraryName (version)
+# Example:
+#   - ArduinoJson (7.2.1)
+#   - NimBLE-Arduino (2.3.4)

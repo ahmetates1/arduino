@@ -1,0 +1,14 @@
+profiles:
+  default:
+    fqbn: arduino:avr:nano:cpu=atmega328old
+    platforms:
+      - platform: arduino:avr (1.8.8)
+    libraries: []
+default_profile: default
+
+# Add your libraries here in the format:
+# libraries:
+#   - LibraryName (version)
+# Example:
+#   - ArduinoJson (7.2.1)
+#   - NimBLE-Arduino (2.3.4)

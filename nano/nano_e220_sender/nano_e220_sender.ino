@@ -14,7 +14,8 @@
  * Paket formati (gateway / tanks ile uyumlu):
  *   NETWORK_ID|NODE_ID|low|mid|high
  *
- * Ornek: 7|1|3|42|0  (low=seq, mid=uptime sn)
+ * Ornek: 7|1|3|42|0  (low=seq, mid=uptime sn, high=0 rutin)
+ * Hareket (D2, HIGH=algilandi): ek paket 7|1|seq|uptime|1
  *
  * Role (ESP32): seri monitorden  on  /  off  /  toggle
  *   -> 7|2|0|0|1  ac   /  7|2|0|0|0  kapa
@@ -35,13 +36,18 @@ const unsigned long SEND_INTERVAL_MS = 9000;
 const unsigned long LORA_BAUD = 9600;
 const unsigned long TX_LED_MS = 80;  // gonderimde kisa yanip sonme
 
+#define MOTION_PIN 2
+const unsigned long MOTION_COOLDOWN_MS = 2500;
+
 #ifndef TX_LED_PIN
 #define TX_LED_PIN LED_BUILTIN  // Nano: D13
 #endif
 
 unsigned long lastTx = 0;
+unsigned long lastMotionTxMs = 0;
 unsigned long txLedOffMs = 0;
 bool txLedOn = false;
+bool motionPrevHigh = false;
 
 void blinkTxLed() {
   digitalWrite(TX_LED_PIN, HIGH);
@@ -56,7 +62,7 @@ void updateTxLed() {
   }
 }
 
-void sendPacket() {
+void sendTelemetry(int high) {
   txSeq++;
 
   loraSerial.print(NETWORK_ID);
@@ -67,10 +73,10 @@ void sendPacket() {
   loraSerial.print('|');
   loraSerial.print(millis() / 1000UL);
   loraSerial.print('|');
-  loraSerial.println(0);
+  loraSerial.println(high);
   loraSerial.flush();
 
-  Serial.print(F("[LoRa TX] "));
+  Serial.print(high == 1 ? F("[LoRa TX motion] ") : F("[LoRa TX] "));
   Serial.print(NETWORK_ID);
   Serial.print('|');
   Serial.print(NODE_ID);
@@ -78,14 +84,33 @@ void sendPacket() {
   Serial.print(txSeq);
   Serial.print('|');
   Serial.print(millis() / 1000UL);
-  Serial.println(F("|0"));
+  Serial.print('|');
+  Serial.println(high);
 
   blinkTxLed();
+}
+
+void sendPacket() {
+  sendTelemetry(0);
+}
+
+void handleMotionSensor() {
+  const bool motionHigh = digitalRead(MOTION_PIN) == HIGH;
+  const unsigned long now = millis();
+
+  if (motionHigh && !motionPrevHigh &&
+      now - lastMotionTxMs >= MOTION_COOLDOWN_MS) {
+    lastMotionTxMs = now;
+    sendTelemetry(1);
+  }
+
+  motionPrevHigh = motionHigh;
 }
 
 void setup() {
   pinMode(TX_LED_PIN, OUTPUT);
   digitalWrite(TX_LED_PIN, LOW);
+  pinMode(MOTION_PIN, INPUT);
 
   Serial.begin(9600);
   loraSerial.begin(LORA_BAUD);
@@ -108,6 +133,7 @@ void setup() {
   Serial.println(F("Role: on / off / toggle"));
   Serial.println(F("Seri monitör: 9600, satir sonu = Newline"));
   Serial.println(F("TX LED: gonderimde kisa yanar (D13)"));
+  Serial.println(F("Hareket: D2, HIGH -> ek paket high=1"));
 }
 
 void sendRelayCommand(int highVal) {
@@ -163,6 +189,7 @@ void handleSerialCommand() {
 void loop() {
   updateTxLed();
   handleSerialCommand();
+  handleMotionSensor();
 
   unsigned long now = millis();
   if (now - lastTx < SEND_INTERVAL_MS) {
